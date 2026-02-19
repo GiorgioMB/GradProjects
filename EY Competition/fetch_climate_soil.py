@@ -3,9 +3,7 @@ import pandas as pd
 import numpy as np
 from time import sleep
 
-# -----------------------------------------------------------------------------
-# 1. METEOROLOGY (Rainfall & Temp) via Open-Meteo API
-# -----------------------------------------------------------------------------
+# --- 1. METEOROLOGY via Open-Meteo API ---
 def fetch_weather_history(lat, lon, sample_date):
     """
     Fetches historical weather for the specific location and date.
@@ -37,11 +35,8 @@ def fetch_weather_history(lat, lon, sample_date):
         df_weather = pd.DataFrame(data['daily'])
         
         # 3. Calculate Aggregates
-        # Last 7 days
         rain_7d = df_weather['precipitation_sum'].tail(7).sum()
-        # Last 30 days
         rain_30d = df_weather['precipitation_sum'].sum()
-        # Temp mean
         temp_mean = df_weather['temperature_2m_mean'].mean()
         
         return {
@@ -58,14 +53,13 @@ def fetch_weather_history(lat, lon, sample_date):
             "temp_30d_mean": np.nan
         }
 
-# -----------------------------------------------------------------------------
-# 2. SOIL PROPERTIES via SoilGrids REST API
-# -----------------------------------------------------------------------------
+# --- 2. SOIL PROPERTIES via SoilGrids REST API ---
 def fetch_soil_properties(lat, lon):
     """
     Fetches soil chemistry/physics from ISRIC SoilGrids.
     """
     try:
+        # Query for: Clay, pH, Cation Exchange Capacity (CEC) at surface (0-5cm)
         url = f"https://rest.isric.org/soilgrids/v2.0/properties/query"
         params = {
             "lat": lat,
@@ -84,7 +78,6 @@ def fetch_soil_properties(lat, lon):
         for layer in props:
             name = layer['name'] 
             val = layer['depths'][0]['values']['mean']
-            
             if name == 'phh2o': val = val / 10.0 
             result[f"soil_{name}"] = val
             
@@ -97,13 +90,12 @@ def fetch_soil_properties(lat, lon):
             "soil_cec": np.nan
         }
 
-# -----------------------------------------------------------------------------
-# 3. BATCH PROCESSOR
-# -----------------------------------------------------------------------------
+# --- 3. BATCH PROCESSOR ---
 def fetch_environ_features(row):
     lat, lon = row['Latitude'], row['Longitude']
     date = row['Sample Date']
     
+    # Sleep slightly to respect free API rate limits
     sleep(0.1) 
     
     weather = fetch_weather_history(lat, lon, date)
