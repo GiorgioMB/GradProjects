@@ -10,6 +10,7 @@ from tqdm import tqdm
 import config
 import fetch_climate_soil
 
+# --- HELPER: Safe Client ---
 def get_client():
     return pystac_client.Client.open(
         "https://planetarycomputer.microsoft.com/api/stac/v1",
@@ -138,6 +139,7 @@ def fetch_temporal_satellite(row, relaxed_mode=False):
             values['MNDWI'] = (values['green'] - values['swir16']) / (values['green'] + values['swir16'] + eps)
             values['NDVI'] = (values['nir08'] - values['red']) / (values['nir08'] + values['red'] + eps)
             
+            # Return dict with CONSISTENT column order
             return {
                 'Latitude': float(lat),
                 'Longitude': float(lon),
@@ -154,6 +156,7 @@ def fetch_temporal_satellite(row, relaxed_mode=False):
 
         except Exception as e:
             if attempt == attempts - 1:
+                # Return dict with CONSISTENT column order
                 return {
                     'Latitude': float(row['Latitude']),
                     'Longitude': float(row['Longitude']),
@@ -171,9 +174,7 @@ def fetch_temporal_satellite(row, relaxed_mode=False):
 
 # --- 4. ORCHESTRATOR ---
 def enrich_dataset(df, cache_path):
-    """
-    Iterates through locations to add Engineering, OSM, AND Environment features.
-    """
+    # 1. Create a composite key for deduplication
     df['key'] = (
         df['Latitude'].astype(str) + "_" + 
         df['Longitude'].astype(str) + "_" + 
@@ -182,9 +183,11 @@ def enrich_dataset(df, cache_path):
     
     unique_rows = df.drop_duplicates(subset=['key'])
     
+    # 2. Load existing cache
     if os.path.exists(cache_path):
         print(f"Loading context cache '{cache_path}'...")
         cached_df = pd.read_csv(cache_path)
+        # Reconstruct key in cache to check what's missing
         cached_df['key'] = (
             cached_df['Latitude'].astype(str) + "_" + 
             cached_df['Longitude'].astype(str) + "_" + 
@@ -195,17 +198,21 @@ def enrich_dataset(df, cache_path):
         cached_df = pd.DataFrame()
         existing_keys = set()
         
+    # 3. Identify Missing Data
     to_compute = unique_rows[~unique_rows['key'].isin(existing_keys)]
     
     if to_compute.empty:
         print("All context data found in cache.")
+        # Clean up temporary key
         if 'key' in cached_df.columns: cached_df = cached_df.drop(columns=['key'])
         if 'key' in df.columns: df = df.drop(columns=['key'])
         
         return pd.merge(df, cached_df, on=['Latitude', 'Longitude', 'Sample Date'], how='left')
 
+    # 4. Compute Missing (Optimized I/O)
     print(f"Computing Context (OSM, Terrain, Weather, Soil) for {len(to_compute)} rows...")
     
+    # Setup for appending
     header_needed = not os.path.exists(cache_path)
     chunk_size = 10
     new_results_accumulator = []
@@ -218,18 +225,15 @@ def enrich_dataset(df, cache_path):
         for idx, row in chunk.iterrows():
             lat, lon = row['Latitude'], row['Longitude']
             
-            # A. Fetch Static Data (OSM, Terrain)
             osm = fetch_osm_context(lat, lon)
             terrain = fetch_terrain_features(lat, lon)
             
-            # B. Fetch Dynamic/Env Data
             env = fetch_climate_soil.fetch_environ_features(row)
             
-            # C. Combine everything
             combined = {
                 'Latitude': lat, 
                 'Longitude': lon, 
-                'Sample Date': row['Sample Date'],
+                'Sample Date': row['Sample Date'], e
                 **osm, 
                 **terrain,
                 **env
@@ -244,9 +248,9 @@ def enrich_dataset(df, cache_path):
         
         new_results_accumulator.append(batch_df)
 
+    # 5. Final Merge
     if new_results_accumulator:
         new_results_df = pd.concat(new_results_accumulator, ignore_index=True)
-        # Drop key from cache before concat if it exists
         if 'key' in cached_df.columns: cached_df = cached_df.drop(columns=['key'])
         final_cache = pd.concat([cached_df, new_results_df], ignore_index=True)
     else:
