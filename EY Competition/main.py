@@ -2,6 +2,7 @@ import warnings
 warnings.filterwarnings('ignore')
 import os
 import pandas as pd
+import numpy as np
 import concurrent.futures
 from tqdm import tqdm
 
@@ -55,9 +56,7 @@ def main():
     print("   WATER QUALITY PREDICTION PIPELINE")
     print("==========================================")
     
-    # --------------------------------------------------------
-    # STEP 1: LOAD BASE DATA
-    # --------------------------------------------------------
+    # --- 1: LOAD BASE DATA ---
     print("\n1. Loading Base Data...")
     if not os.path.exists(config.TRAIN_FILE):
         print(f"Error: {config.TRAIN_FILE} not found.")
@@ -66,12 +65,9 @@ def main():
     train_df = pd.read_csv(config.TRAIN_FILE)
     print(f"   Loaded {len(train_df)} rows.")
 
-    # --------------------------------------------------------
-    # STEP 2: SATELLITE DATA ACQUISITION
-    # --------------------------------------------------------
+    # --- 2: SATELLITE DATA ACQUISITION---
     print("\n2. Processing Satellite Data...")
     
-    # First, clean/validate existing satellite CSV if it exists
     if os.path.exists(config.SAT_CACHE):
         clean_satellite_csv(config.SAT_CACHE)
     
@@ -111,6 +107,7 @@ def main():
             for i, future in tqdm(enumerate(concurrent.futures.as_completed(future_to_idx)), total=len(rows_to_process)):
                 try:
                     result = future.result()
+                    # Ensure identifiers are present with proper types
                     idx = future_to_idx[future]
                     row = train_df.loc[idx]
                     result['Latitude'] = float(row['Latitude'])
@@ -119,7 +116,9 @@ def main():
                     
                     batch_results.append(result)
                 except Exception as e:
-                    pass 
+                    pass # Skip failures here, we catch them in rescue phase
+
+                # Save Batch with ENFORCED column order
                 if len(batch_results) >= save_interval or (i + 1) == len(rows_to_process):
                     new_df = pd.DataFrame(batch_results)
                     
@@ -134,15 +133,15 @@ def main():
                     batch_results = []
         print("   Primary fetch complete.")
 
-    # --------------------------------------------------------
-    # STEP 3: REPAIR FAILED FETCHES
-    # --------------------------------------------------------
+    # --- 3: REPAIR FAILED FETCHES ---
     print("\n3. Verifying & Rescuing Failed Data...")
     sat_df = pd.read_csv(config.SAT_CACHE)
     
+    # Ensure proper types after loading from CSV
     sat_df['Latitude'] = sat_df['Latitude'].astype(float)
     sat_df['Longitude'] = sat_df['Longitude'].astype(float)
     
+    # Check for missing data (using nir08 as proxy for valid download)
     failed_rows = sat_df[sat_df['nir08'].isna()]
     
     if not failed_rows.empty:
@@ -157,7 +156,8 @@ def main():
             for f in tqdm(concurrent.futures.as_completed(futures), total=len(failed_rows)):
                 try:
                     res = f.result()
-                    if not pd.isna(res.get('nir08')):
+                    # Only keep if we actually got data this time
+                    if not pd.isna(res.get('nir08')):  
                         rescued_results.append(res)
                 except:
                     continue
@@ -166,12 +166,15 @@ def main():
             print(f"   Rescued {len(rescued_results)} rows!")
             rescued_df = pd.DataFrame(rescued_results)
             
+            # Enforce consistent column order for rescued data
             column_order = ['Latitude', 'Longitude', 'Sample Date', 
                           'green', 'red', 'nir08', 'swir16', 'swir22', 
                           'NDMI', 'MNDWI', 'NDVI']
             rescued_df = rescued_df[column_order]
             
-            clean_df = sat_df.dropna(subset=['nir08'])  
+            # Remove the still-broken rows from original and append the fixed ones
+            clean_df = sat_df.dropna(subset=['nir08']) 
+            
             sat_df = pd.concat([clean_df, rescued_df], ignore_index=True)
             sat_df = sat_df.drop_duplicates(subset=['Latitude', 'Longitude', 'Sample Date'])
             sat_df.to_csv(config.SAT_CACHE, index=False)
@@ -181,6 +184,7 @@ def main():
     else:
         print("   All satellite data looks good.")
     
+    # Reload satellite data to ensure we have the latest version
     print("   Reloading satellite data for merge...")
     sat_df = pd.read_csv(config.SAT_CACHE)
     sat_df['Latitude'] = sat_df['Latitude'].astype(float)
@@ -211,36 +215,115 @@ def main():
     full_df.to_csv("water_quality_post_merge.csv", index=False)
     print("   Saved 'water_quality_post_merge.csv'")
 
-    # --------------------------------------------------------
-    # STEP 4: ENRICHMENT (OSM & TERRAIN)
-    # --------------------------------------------------------
+    # --- 4: ENRICHMENT ---
     print("\n4. Enriching with OSM & Terrain Data...")
     pre_enrich_cols = set(full_df.columns)
     full_df = data_fetch.enrich_dataset(full_df, config.OSM_CACHE)
     
-    # Verify what was added
     new_cols = set(full_df.columns) - pre_enrich_cols
     print(f"   Added {len(new_cols)} new columns: {sorted(new_cols)}")
     
-    # Save post-enrichment checkpoint
     full_df.to_csv("water_quality_post_enrichment.csv", index=False)
     print("   Saved 'water_quality_post_enrichment.csv'")
 
-    # --------------------------------------------------------
-    # STEP 5: IMPUTATION
-    # --------------------------------------------------------
+    # --- 5: IMPUTATION ---
     print("\n5. Running Statistical Imputation...")
     full_df = imputation.diagnose_and_impute(full_df)
     
     # Save final processed dataset
     full_df.to_csv("water_quality_processed_final.csv", index=False)
     print("   Saved 'water_quality_processed_final.csv'")
+        
+    # --- STEP 6: MODELING ---
+    # Set to True to train on log1p(y) and convert predictions back via expm1.
+    # Set to False to train on raw y directly.
+    LOG_TRANSFORM = False
 
-    # --------------------------------------------------------
-    # STEP 6: MODELING
-    # --------------------------------------------------------
     print("\n6. Training Models...")
-    modeling.train_models(full_df)
+    print(f"   LOG_TRANSFORM = {LOG_TRANSFORM}")
+    performance_report = modeling.train_models(full_df, log_transform=LOG_TRANSFORM)
+
+    # --- 7: GENERATE SUBMISSION ---
+    print("\n7. Generating Submission Predictions...")
+    generate_submission(full_df, performance_report)
+
+
+def generate_submission(train_df, performance_report):
+    """
+    Loads submission_template.csv, fetches features for test rows (re-using
+    cached data where possible), engineers features, and predicts using
+    the trained models.
+    """
+
+    sub_path = os.path.join(config.DATA_DIR, "submission_template.csv")
+    if not os.path.exists(sub_path):
+        print(f"   Warning: '{sub_path}' not found. Skipping submission.")
+        return
+
+    sub_df = pd.read_csv(sub_path)
+    print(f"   Loaded {len(sub_df)} submission rows.")
+
+    # --- Fetch satellite data for test rows ---
+    print("   Fetching satellite data for submission rows...")
+    sat_results = []
+    for _, row in sub_df.iterrows():
+        result = data_fetch.fetch_temporal_satellite(row)
+        sat_results.append(result)
+    sat_test = pd.DataFrame(sat_results)
+
+    sub_for_merge = sub_df.drop(columns=config.TARGETS, errors='ignore').copy()
+    # Round lat/lon to avoid float precision mismatches during merge
+    sub_for_merge['Latitude'] = sub_for_merge['Latitude'].astype(float).round(6)
+    sub_for_merge['Longitude'] = sub_for_merge['Longitude'].astype(float).round(6)
+    sat_test['Latitude'] = sat_test['Latitude'].astype(float).round(6)
+    sat_test['Longitude'] = sat_test['Longitude'].astype(float).round(6)
+
+    test_df = pd.merge(sub_for_merge, sat_test,
+                       on=['Latitude', 'Longitude', 'Sample Date'], how='left')
+
+    # --- Enrich with OSM / terrain / weather / soil ---
+    print("   Enriching submission rows...")
+    test_df = data_fetch.enrich_dataset(test_df, config.OSM_CACHE)
+
+    # --- Imputation ---
+    test_df = imputation.diagnose_and_impute(test_df)
+
+    # --- Feature engineering ---
+    test_df = modeling.engineer_features(test_df)
+
+    # --- Predict each target ---
+    for target in config.TARGETS:
+        if target not in performance_report:
+            print(f"   Skipping {target} — no trained model.")
+            continue
+
+        model = performance_report[target]['model']
+        features = performance_report[target]['features']
+
+        for f in features:
+            if f not in test_df.columns:
+                test_df[f] = np.nan
+
+        X_test = test_df[features]
+        raw_preds = model.predict(np.array(X_test))
+
+        use_log = performance_report[target].get('log_transform', False)
+        if use_log:
+            preds = np.expm1(raw_preds)
+            n_nan = np.isnan(preds).sum()
+            if n_nan > 0:
+                print(f"     expm1 produced {n_nan} NaN predictions for {target}!")
+        else:
+            preds = raw_preds
+
+        preds = np.clip(preds, 0, None)
+        sub_df[target] = preds
+        print(f"   {target}: mean={preds.mean():.2f}, std={preds.std():.2f}")
+
+    # --- Save submission ---
+    out_path = "submission.csv"
+    sub_df.to_csv(out_path, index=False)
+    print(f"\n   Submission saved to '{out_path}' ({len(sub_df)} rows)")
 
 if __name__ == "__main__":
     main()
