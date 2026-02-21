@@ -26,56 +26,97 @@ This pipeline constructs a rich feature space from **five independent geospatial
 
 ### Feature Engineering (50+ features from 5 sources)
 
+
 | Source | API / Dataset | Features Derived |
 |---|---|---|
-|  **Satellite Imagery** | Landsat C2 L2 via [Planetary Computer](https://planetarycomputer.microsoft.com/) | Surface reflectance (green, red, NIR, SWIR), spectral indices (NDVI, NDMI, MNDWI), band ratios (NIR/Green, SWIR ratio, NBR) |
-|  **Land Use** | [OpenStreetMap](https://www.openstreetmap.org/) via osmnx | Counts of industrial sites, farmland, mines, wastewater plants within 5 km |
-|  **Terrain** | [NASADEM](https://www.earthdata.nasa.gov/sensors/nasadem) via Planetary Computer | Elevation, slope, aspect, valley depth, elevation x slope interactions |
-|  **Weather** | [Open-Meteo Archive API](https://open-meteo.com/) | 7-day & 30-day rainfall accumulation, 30-day mean temperature, rain intensity ratio |
-|  **Soil** | [ISRIC SoilGrids](https://soilgrids.org/) | Clay content, pH, cation exchange capacity *(API unreliable — handled gracefully)* |
+| **Satellite Imagery** | Landsat C2 L2 via [Planetary Computer](https://planetarycomputer.microsoft.com/) | Surface reflectance (green, red, NIR, SWIR16, SWIR22), spectral indices (NDVI, NDMI, MNDWI) |
+| **Land Use (OSM)** | [OpenStreetMap](https://www.openstreetmap.org/) via osmnx | Counts of industrial sites, farmland, mines, wastewater plants within 5 km |
+| **Land Cover** | [ESA WorldCover 10m](https://esa-worldcover.org/) via Planetary Computer | Fractional cover of 8 land classes (tree, shrub, grass, crop, built-up, bare, water, wetland), landscape diversity index |
+| **Terrain** | [NASADEM](https://www.earthdata.nasa.gov/sensors/nasadem) via Planetary Computer | Elevation (mean, std), slope (mean, std), aspect |
+| **Weather** | [Open-Meteo Archive API](https://open-meteo.com/) | 7/30-day rainfall, temperature, evapotranspiration, wind speed, humidity, solar radiation, water balance (rain − ET) |
+| **Soil** | [ISRIC SoilGrids](https://soilgrids.org/) | Clay content, pH, cation exchange capacity *(API unreliable — handled gracefully)* |
+| **Surface Water** | [JRC Global Surface Water](https://global-surface-water.appspot.com/) via Planetary Computer | Water occurrence (mean/max), water fraction, seasonality (months/year) |
+| **Geology** | [Macrostrat](https://macrostrat.org/) | Lithology category (sedimentary/carbonate/metamorphic/igneous/unconsolidated), rock age (Ma), karst indicator |
+| **Population** | ESA WorldCover built-up fraction (5 km buffer) | Population pressure proxy, urbanisation intensity |
+| **Water Infrastructure** | [OpenStreetMap](https://www.openstreetmap.org/) via osmnx | Dam/weir count within 10 km, reservoir count, nearest dam distance, dam presence flag |
+| **Water Body Type** | [OpenStreetMap](https://www.openstreetmap.org/) via osmnx | River/stream/lake/canal counts, dominant water body classification, flowing vs standing water |
 
-On top of raw features, the pipeline engineers:
-- **Temporal features** — cyclical month encoding, season, day of year
-- **Spatial features** — rounded lat/lon clusters, lat x lon interaction
-- **Per-location temporal lags** — lag-1, diff-1, rolling-3-mean on sensor & weather data per monitoring station, days since last measurement, observation count
-- **Spectral interactions** — NIR/Green ratio, SWIR ratio, NBR, Green/Red ratio
-- **Cross-domain interactions** — elevation x slope, elevation x rainfall
+On top of raw features, `engineer_features()` creates ~60 derived features:
+- **Temporal** — cyclical month encoding (sin/cos), season (southern hemisphere), day of year
+- **17 Spectral indices** — NDVI, NDMI, MNDWI, NBR, BSI, EVI, SAVI, NDWI, LSWI, TCW, TCB, TCG, NWI, WRI, AWEI_sh, AWEI_nsh, Green/Red ratio
+- **Terrain derivatives** — elevation x slope, elevation x aspect, slope x aspect, terrain ruggedness (std x slope)
+- **Weather interactions** — ET x temperature (aridity), water_balance x elevation, humidity x temperature (bioactivity), radiation x water (algal bloom proxy)
+- **Land cover combinations** — cropland x rainfall (nutrient runoff), urban x rainfall, natural-vs-disturbed ratio
+- **Geology interactions** — karst x rainfall (alkalinity driver), karst x water_occurrence
+- **Water interactions** — water_fraction x elevation, dam_presence x rainfall, stream_density x rainfall
+- **Nitrogen deposition proxies** — agricultural (cropland x rain x NDVI), urban (built-up x rain), combined N-pressure
+
+Plus **51 KNN spatial features** from `SpatialKNNEncoder`:
+- For each target, at k = {5, 10, 15, 25}: mean, median, std, distance-weighted mean of nearest neighbours
+- Plus `nn_dist_mean` — average distance to 5 nearest neighbours
+- KNN encoder is **refit inside each CV fold** to prevent spatial leakage
+
+Plus **cross-target features** from `CrossTargetFeaturizer` (when inter-target correlation is detected):
+- The pipeline first checks pairwise Pearson and Spearman correlations between all 3 targets
+- If any pair has $|\text{Spearman  } \rho|>0.15$, it generates out-of-fold (OOF) predictions of each target using a lightweight Ridge model, then feeds those predictions as features for the *other* targets
+- This exploits the physical relationship between water quality indicators (e.g. Alkalinity and Conductance are both driven by dissolved minerals) without leaking. OOF ensures row $i$'s cross-target feature was predicted by a model that never saw row $i$
+- At test time, the Ridge models fitted on all training data predict each target first, then those predictions become features for the full ensemble
 
 ### Modelling
 
-A **Performance-Weighted Ensemble** of four diverse base learners:
+A custom $R^2$**-Weighted Ensemble** of five diverse base learners per target:
 
 | Model | Role | NaN Handling |
 |---|---|---|
-| **XGBoost** | Primary gradient boosting (3000 trees, tuned) | Native |
+| **XGBoost** | Primary gradient boosting (conservative: max_depth 3–4, min_child_weight 25–50, reg_lambda 8–15) | Native |
 | **LightGBM** | Secondary gradient boosting for diversity | Native |
-| **TabNet** | Attention-based deep learning for tabular data | Custom sklearn wrapper with internal imputation & standardisation |
-| **Random Forest** | Bagging diversity | Pipeline-wrapped with median imputation |
+| **CatBoost** | Third gradient booster with ordered boosting for categorical-like features | Native |
+| **ExtraTrees** | Extremely randomised trees for variance reduction | Pipeline-wrapped with median imputation + scaling |
+| **Ridge** | Linear baseline for stability and diversity | Pipeline-wrapped with median imputation + scaling |
 
-**Weight determination:** During training, each model is evaluated via internal cross-validation. Weights are set proportional to each model's $R^2$: for the $i$-th model, $w_i = \min\left\\{0, R^2_i\right\\}$. This means the ensemble automatically drops any model that underperforms predicting the mean.
+**Hyperparameter tuning:** Optuna (30 trials) with conservative search bounds:
+- `max_depth`: 3–5
+- `min_child_weight`: 20–60
+- `reg_lambda` / `reg_alpha`: 3–20
+- `learning_rate`: 0.005–0.05
+
+**Ensemble weight determination:** Each model is evaluated via internal GroupKFold CV. Final ensemble weights are proportional to each model's $R^2$ — models with $R^2\le 0$ receive zero weight.
+
+**Feature pruning:** An optional step (`prune_features()`) removes low-importance features via permutation importance.
 
 ### Evaluation Protocol
 
-**Nested spatial cross-validation** — a rigorous evaluation avoiding both spatial leakage and weight-selection bias:
+**Spatial cross-validation** with per-fold KNN refitting:
 
 ```
-Outer loop (5-fold GroupKFold by location):
-  -> Unbiased performance estimation
-  
-  Inner loop (5-fold GroupKFold on training split):
-    -> Determines per-model weights for the ensemble
-    -> Refits all models on full training split
-  
-  -> Predict on held-out spatial test fold
+GroupKFold (5-fold, grouped by rounded lat/lon ≈ 1 km):
+  For each fold:
+    1. Refit KNN encoder on training split only
+    2. Transform both train and test splits
+    3. Train all 5 base models on train split
+    4. Predict on held-out spatial test fold
+    5. Report R^2 and train-test gap (overfitting monitor)
 ```
 
-Groups are defined by rounding coordinates to 2 decimal places (~1 km), ensuring nearby stations are never split across train and test.
 
-- **No spatial leakage** — GroupKFold ensures entire monitoring stations are held out, not individual observations
-- **Temporal lag safety** — lag features use only past non-target measurements, safe for inference
-- **Robust to missing data** — MICE imputation with Random Forest estimator, plus median fallback for any remaining NaNs
-- **Log-transform as a flag** — configurable `LOG_TRANSFORM` toggle for experimentation (defaults to raw scale)
-- **NaN monitoring** — the pipeline prints warnings whenever `log1p`/`expm1` produces NaN values
+## 📊 EDA Report
+
+An automated Exploratory Data Analysis report is generated as part of the pipeline (between imputation and modelling). It produces a self-contained HTML file (`eda_report.html`) with 9 sections:
+
+1. **Dataset Overview** — shape, target coverage, missingness summary
+2. **Target Distributions** — histograms and statistics for each target
+3. **Feature–Target Correlations** — Spearman $\rho$ (top-30 per target + cross-target heatmap)
+4. **Mutual Information** — nonlinear predictive power ranking
+5. **Feature Distributions** — histograms of the top-12 most predictive features
+6. **Spatial Analysis** — scatter maps of targets and station density
+7. **Temporal Analysis** — monthly trends and seasonal boxplots
+8. **Collinearity Diagnosis** — high-correlation pairs and heatmap
+9. **Modellability Assessment** — quick RandomForest spatial CV to gauge signal strength
+
+Can also be run standalone:
+```bash
+python eda_report.py --top 30
+```
 
 ---
 
@@ -83,12 +124,15 @@ Groups are defined by rounding coordinates to 2 decimal places (~1 km), ensuring
 
 ```
 EY Competition/
-├── main.py                   #  Pipeline orchestrator (Steps 1–7)
-├── modeling.py               #  Feature engineering, models, ensemble, evaluation
+├── main.py                   #  Pipeline orchestrator (load -> enrich -> impute -> EDA -> model -> submit)
+├── modeling.py               #  Feature engineering, models, ensemble, evaluation, Optuna tuning
 ├── data_fetch.py             #  Satellite, OSM, terrain data acquisition
 ├── fetch_climate_soil.py     #  Weather & soil API integration
-├── imputation.py             #  MICE imputation with missingness diagnosis
-└── config.py                 #  Paths, targets, satellite settings
+├── fetch_geo_features.py     #  WorldCover, JRC water, geology, population, water infra
+├── imputation.py             #  BayesianRidge IterativeImputer with missingness diagnosis
+├── eda_report.py             #  Auto-generated HTML EDA report (9 sections)
+└── config.py                 #  Paths, targets, dead features, satellite settings
+├── run_parallel.sh           #  SLURM job script (64 cores, 256G RAM, 120h)
 ```
 
 ---
@@ -98,30 +142,32 @@ EY Competition/
 ### Prerequisites
 
 ```bash
-pip install numpy pandas scikit-learn xgboost lightgbm joblib tqdm
-pip install pystac-client planetary-computer odc-stac osmnx requests
-
-# Optional
-pip install pytorch-tabnet
+pip install numpy pandas scikit-learn xgboost lightgbm catboost optuna joblib tqdm
+pip install pystac-client planetary-computer odc-stac osmnx requests rasterio
+pip install matplotlib seaborn scipy
 ```
 
 ### Local Execution
 
 ```bash
-cd comp/
+cd EY Competition/
 python main.py
 ```
 
-The pipeline is fully **resumable** — satellite and enrichment data are cached to disk. If interrupted, re-running picks up where it left off.
+The pipeline is fully **resumable**, satellite and enrichment data are cached to disk. If interrupted, re-running picks up where it left off.
+
+**Flags:**
+- `--fast` — skip enrichment, use only base + satellite data (quick test)
+- `--skip-fetch` — load pre-enriched data from `water_quality_post_enrichment.csv`
 
 
 ### Configuration
 
-Edit `config.py` for paths and satellite settings. In `main.py`, toggle:
-
-```python
-LOG_TRANSFORM = False  # Set True to train on log1p(y), False for raw scale
-```
+Edit `config.py` for paths and satellite settings:
+- `TARGETS` — the three target columns
+- `SAT_CACHE`, `OSM_CACHE`, `GEO_CACHE` — cache file paths
+- `DEAD_FEATURES` — columns excluded from modelling (SoilGrids NaN, constant-zero land cover)
+- `SAT_WINDOW_DAYS`, `SAT_CLOUD_MAX` — satellite query parameters
 
 ---
 
@@ -129,20 +175,34 @@ LOG_TRANSFORM = False  # Set True to train on log1p(y), False for raw scale
 
 | Step | What happens |
 |---|---|
-| **1. Load Data** | Reads 9,320 training samples with 3 targets |
-| **2. Satellite Fetch** | Queries Landsat C2 L2 via Planetary Computer STAC API for each (lat, lon, date). Computes median composite within a 60-day window. Extracts surface reflectance bands and spectral indices. Fully parallelised (8 threads) with incremental CSV saves. |
-| **3. Rescue** | Re-attempts failed satellite downloads with relaxed cloud cover and wider time windows. |
-| **4. Enrichment** | Adds OSM land-use counts, NASADEM terrain features, Open-Meteo weather history, and SoilGrids soil chemistry for each location+date. Cached per-row. |
-| **5. Imputation** | Diagnoses missingness pattern (MAR test via AUC), then applies MICE (Iterative Imputer with RF estimator). Final median fallback for any residuals. |
-| **6. Modelling** | Engineers 50+ features, trains a performance-weighted ensemble per target and saves production models to disk. |
-| **7. Submission** | Fetches features for 201 test rows through the same pipeline, predicts with trained models, and writes `submission.csv`. |
+| **1. Load Data** | Reads 9,319 training samples with 3 targets |
+| **2. Satellite Merge** | Loads cached Landsat C2 L2 features via float-tolerant key matching (lat/lon rounded to 4 decimals). Fetches missing rows via Planetary Computer STAC API (8 threads, incremental saves). |
+| **3. Enrichment** | Adds 11 data sources: OSM land-use, NASADEM terrain, Open-Meteo weather, SoilGrids soil, ESA WorldCover, JRC surface water, Macrostrat geology, population density, water infrastructure, water body type. All cached per-row. |
+| **4. Imputation** | BayesianRidge IterativeImputer with missingness diagnosis. Saves imputer state for test-time consistency. Final median fallback for any residuals. |
+| **4b. EDA Report** | Generates a self-contained HTML report with 9 analytical sections covering distributions, correlations, spatial/temporal patterns, collinearity, and modellability assessment. |
+| **5. Modelling** | Engineers ~60 features -> adds 51 KNN spatial features (refit per fold) -> checks inter-target correlations and adds cross-target OOF features if exploitable -> Optuna tunes hyperparameters (30 trials) -> trains 5-model $R^2$-weighted ensemble per target -> spatial GroupKFold CV with train-test gap monitoring -> saves production models. |
+| **6. Submission** | Fetches features for 200 test rows through the same pipeline, predicts with trained ensemble, inverts log1p, clips to $\ge$0, writes `submission.csv`. |
 
 ---
 
 ## Technical Highlights
+- **Custom `WeightedEnsemble`** — $R^2$-proportional weighting with automatic exclusion of underperforming models, internal GroupKFold for weight determination
+- **Custom `SpatialKNNEncoder`** — $k$-nearest-neighbour target features at multiple scales (k=5,10,15,25), refit inside each CV fold to prevent leakage, with automatic $k$-clamping for small folds
+- **Custom `CrossTargetFeaturizer`** — OOF predictions of correlated targets as features, exploiting inter-target correlations without leaking; automatically disabled when correlations are too weak
+- **Per-target regularisation** — XGBoost/LightGBM/CatBoost hyperparameters tuned independently per target with conservative Optuna bounds
+- **Anti-overfitting monitoring** — train-test $R^2$ gap printed per fold; consistently high gaps trigger manual regularisation review
+- **Feature pruning with safety floor** — permutation importance pruning
+- **Incremental caching everywhere** — satellite, OSM/terrain, weather, and geo data are all cached and resumable
+- **Production-ready model persistence** — trained ensembles + imputer state saved via `joblib` for deployment without retraining
+- **Integrated EDA** — automated 9-section HTML report generated before modelling to diagnose data quality issues early
 
-- **Custom `PerformanceWeightedEnsemble`**: a fully sklearn-compatible estimator with `fit`/`predict` interface, internal CV for adaptive weighting, and automatic exclusion of underperforming models
-- **Custom `SklearnTabNetRegressor`**: wraps pytorch-tabnet for sklearn compatibility, with built-in NaN imputation, standardisation, and early stopping
-- **Spatial CV with proper nesting**: outer folds for metrics, inner folds for weight tuning, all grouped by geographic location
-- **Incremental caching everywhere**: satellite fetches, OSM/terrain enrichment, and weather data are all cached and resumable. The full pipeline can be interrupted and restarted without losing progress.
-- **Production-ready model persistence**: trained ensembles saved via `joblib` for deployment without retraining
+---
+
+## 📬 About Me
+
+I'm a PhD student and this was my first data science competition. I built this entire pipeline from scratch — from querying satellite APIs to designing a custom ensemble architecture. What started as a learning exercise became a fully-engineered, production-grade ML system with a strong focus on generalisation to unseen locations.
+
+---
+
+*Built with Python · scikit-learn · XGBoost · LightGBM · CatBoost · Optuna · Planetary Computer · Open-Meteo*
+
