@@ -1,15 +1,17 @@
 import pandas as pd
 import numpy as np
-from sklearn.experimental import enable_iterative_imputer 
+from sklearn.experimental import enable_iterative_imputer   # noqa
 from sklearn.impute import IterativeImputer
 from sklearn.linear_model import BayesianRidge
 import joblib
 
 
 def diagnose_and_impute(df, fit_imputer=True, imputer_path="imputer_state.joblib"):
-    print("\n Diagnosing Missing Data")
+    print("\n-- Diagnosing Missing Data --")
 
     df = df.copy()
+
+    # Ensure temporal features exist for the imputer
     df['Sample Date'] = pd.to_datetime(df['Sample Date'], dayfirst=True)
     if 'Month' not in df.columns:
         df['Month'] = df['Sample Date'].dt.month
@@ -25,6 +27,7 @@ def diagnose_and_impute(df, fit_imputer=True, imputer_path="imputer_state.joblib
     impute_cols = context_cols + sat_cols
     valid_cols  = [c for c in impute_cols if c in df.columns]
 
+    # Drop fully-NaN columns
     fully_nan = [c for c in valid_cols if df[c].isna().all()]
     if fully_nan:
         print(f"   Dropping {len(fully_nan)} fully-NaN columns: {fully_nan}")
@@ -39,10 +42,10 @@ def diagnose_and_impute(df, fit_imputer=True, imputer_path="imputer_state.joblib
             print(f"   {c}: {n_missing[c]} missing ({pct:.1f}%)")
 
     if fit_imputer:
-        print("── Fitting Iterative Imputer (BayesianRidge) ──")
+        print("-- Fitting Iterative Imputer (BayesianRidge) --")
         imputer = IterativeImputer(
             estimator=BayesianRidge(),
-            max_iter=10,
+            max_iter=500,
             random_state=42,
             verbose=1,
         )
@@ -58,6 +61,7 @@ def diagnose_and_impute(df, fit_imputer=True, imputer_path="imputer_state.joblib
         for c in df.select_dtypes(include=[np.number]).columns:
             train_medians[c] = df[c].median()
 
+        # Save state
         joblib.dump({
             'imputer':    imputer,
             'valid_cols': valid_cols,
@@ -66,7 +70,7 @@ def diagnose_and_impute(df, fit_imputer=True, imputer_path="imputer_state.joblib
         print(f"   Saved imputer state to '{imputer_path}'")
 
     else:
-        print("── Loading saved imputer ──")
+        print("-- Loading saved imputer --")
         state = joblib.load(imputer_path)
         imputer       = state['imputer']
         saved_cols    = state['valid_cols']
@@ -86,7 +90,7 @@ def diagnose_and_impute(df, fit_imputer=True, imputer_path="imputer_state.joblib
             if c in df.columns:
                 df[c] = imputed_df[c]
 
-    print("── Final NaN cleanup ──")
+    print("-- Final NaN cleanup --")
     if fit_imputer:
         medians = train_medians
     else:
