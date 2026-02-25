@@ -3,6 +3,7 @@ warnings.filterwarnings('ignore')
 import os
 import sys
 import time
+import traceback
 import pandas as pd
 import numpy as np
 import concurrent.futures
@@ -13,6 +14,7 @@ import data_fetch
 import imputation
 import modeling
 import eda_report
+import dws_data
 
 
 # HELPERS
@@ -63,32 +65,35 @@ def main():
         print(f"   Loaded {len(full_df)} rows, {len(full_df.columns)} cols")
 
     else:
-        print("\n1. Loading base data")
+        print("\n1. Loading base data...")
         if not os.path.exists(config.TRAIN_FILE):
             print(f"   Error: {config.TRAIN_FILE} not found.")
             return
         train_df = pd.read_csv(config.TRAIN_FILE)
         print(f"   Loaded {len(train_df)} rows.")
 
-        print("\n2. Satellite data")
+        print("\n2. Satellite data...")
         if os.path.exists(config.SAT_CACHE):
             clean_satellite_csv(config.SAT_CACHE)
             sat_df = pd.read_csv(config.SAT_CACHE)
             print(f"   Satellite cache: {len(sat_df)} rows")
 
+            # Robust merge on rounded lat/lon + date string
             merge_cols = ['Latitude', 'Longitude', 'Sample Date']
             full_df = robust_merge(train_df, sat_df, merge_cols, how='left')
 
+            # Check coverage
             sat_cols = ['green', 'red', 'nir08', 'swir16', 'swir22',
                         'NDMI', 'MNDWI', 'NDVI']
             n_with_sat = full_df[sat_cols[0]].notna().sum()
             print(f"   Merged: {n_with_sat}/{len(full_df)} rows "
                   f"have satellite data ({100*n_with_sat/len(full_df):.0f}%)")
 
+            # Fetch missing satellite data (if any)
             missing = full_df[full_df['nir08'].isna()]
             if len(missing) > 0 and not fast_mode:
                 print(f"   Fetching satellite for {len(missing)} "
-                      f"missing rows")
+                      f"missing rows…")
                 batch = []
                 with concurrent.futures.ThreadPoolExecutor(
                         max_workers=8) as exe:
@@ -158,7 +163,7 @@ def main():
               f"{len(full_df.columns)} cols")
 
         if not fast_mode:
-            print("\n3. Enrichment (OSM + Terrain + Weather + Geo)")
+            print("\n3. Enrichment (OSM + Terrain + Weather + Geo)...")
             pre_cols = set(full_df.columns)
             full_df = data_fetch.enrich_dataset(full_df, config.OSM_CACHE)
             new_cols = set(full_df.columns) - pre_cols
@@ -167,7 +172,35 @@ def main():
         else:
             print("\n3. --fast mode: Skipping enrichment.")
 
-    print("\n4. Imputation")
+    print("\n3b. DWS External Data Integration...")
+    sub_path = os.path.join(config.DATA_DIR, "submission_template.csv")
+    if os.path.exists(sub_path):
+        test_template = pd.read_csv(sub_path)
+        # Parse dates early so DWS can use them
+        if "Sample Date" in test_template.columns:
+            test_template["date"] = pd.to_datetime(
+                test_template["Sample Date"], dayfirst=True)
+        dws_context = None
+        try:
+            all_dws, station_features, aug_rows = \
+                dws_data.prepare_dws_augmentation(
+                    config.DWS_DIR, config.TARGETS, test_template,
+                    train_df=full_df,
+                    train_csv_path=config.TRAIN_FILE)
+            dws_context = {
+                'all_dws': all_dws,
+                'station_features': station_features,
+                'aug_rows': aug_rows,
+            }
+        except Exception as e:
+            print(f"   Warning: DWS integration failed (non-fatal): {e}")
+            traceback.print_exc()
+            dws_context = None
+    else:
+        print(f"   Warning: No submission template at {sub_path} – skipping DWS")
+        dws_context = None
+
+    print("\n4. Imputation...")
     full_df = imputation.diagnose_and_impute(
         full_df, fit_imputer=True, imputer_path="imputer_state.joblib")
     full_df.to_csv("water_quality_processed_final.csv", index=False)
@@ -180,12 +213,13 @@ def main():
             top_k=30,
         )
     except Exception as e:
-        print(f"   EDA report failed (non-fatal): {e}")
+        print(f"   Warning: EDA report failed (non-fatal): {e}")
 
-    print("\n5. Training models")
-    report = modeling.train_models(full_df, log_transform=None)
+    print("\n5. Training models...")
+    report = modeling.train_models(
+        full_df, log_transform=None, dws_context=dws_context)
 
-    print("\n6. Generating submission")
+    print("\n6. Generating submission...")
     generate_submission(full_df, report)
 
 
@@ -199,13 +233,14 @@ def generate_submission(train_df, report):
     sub_df = pd.read_csv(sub_path)
     print(f"   {len(sub_df)} submission rows.")
 
-    # Satellite
-    print("   Fetching satellite for test rows")
+    print("   Fetching satellite for test rows…")
     sat_res = []
     for _, row in tqdm(sub_df.iterrows(), total=len(sub_df)):
         sat_res.append(data_fetch.fetch_temporal_satellite(row))
     sat_test = pd.DataFrame(sat_res)
 
+    # Build test_df by directly attaching satellite columns (row-aligned)
+    # Avoids many-to-many merge if duplicate (lat, lon, date) exist
     sub_for_merge = sub_df.drop(columns=config.TARGETS, errors='ignore').copy()
     sat_only_cols = [c for c in sat_test.columns
                      if c not in ['Latitude', 'Longitude', 'Sample Date']]
@@ -215,18 +250,59 @@ def generate_submission(train_df, report):
 
     # Enrich (if not in fast mode)
     if '--fast' not in sys.argv:
-        print("   Enriching test rows…")
+        print("   Enriching test rows...")
         test_df = data_fetch.enrich_dataset(test_df, config.OSM_CACHE)
 
-    # Imputation 
+    # Imputation
     test_df = imputation.diagnose_and_impute(
         test_df, fit_imputer=False, imputer_path="imputer_state.joblib")
-
-    # Feature engineering
     test_df = modeling.engineer_features(test_df)
 
-    # KNN spatial features 
-    print("   Adding KNN spatial features")
+    # DWS features for test rows
+    dws_context = report.get('_dws_context')
+    if dws_context is not None:
+        print("   Adding DWS features to test rows…")
+        try:
+            all_dws          = dws_context['all_dws']
+            station_features = dws_context['station_features']
+
+            # Parse date for lag features
+            if 'date' not in test_df.columns or test_df['date'].dtype == object:
+                if 'Sample Date' in test_df.columns:
+                    test_df['date'] = pd.to_datetime(
+                        test_df['Sample Date'], dayfirst=True)
+
+            # Assign station codes
+            test_df['_dws_station'] = test_df.apply(
+                lambda r: dws_data.coord_to_station(
+                    r['Latitude'], r['Longitude']),
+                axis=1,
+            )
+            n_matched = test_df['_dws_station'].notna().sum()
+            print(f"   DWS station match: {n_matched}/{len(test_df)} "
+                  f"test rows")
+
+            # Merge station-level features
+            test_df = dws_data.merge_station_features(
+                test_df, station_features)
+
+            # Add lag features
+            test_df = dws_data.add_lag_features(
+                test_df, all_dws, config.TARGETS)
+
+            # Add same-day auxiliary features (pH, Ca, Mg, etc.)
+            test_df = dws_data.add_sameday_aux_features(
+                test_df, all_dws)
+
+            # Drop helper columns that shouldn't be features
+            test_df.drop(columns=['_dws_station', 'date', 'station'],
+                         errors='ignore', inplace=True)
+        except Exception as e:
+            print(f"   Warning: DWS test features failed (non-fatal): {e}")
+            traceback.print_exc()
+
+    # KNN spatial features
+    print("   Adding KNN spatial features…")
     knn_enc = report.get('_knn_encoder')
     if knn_enc is not None:
         test_df = knn_enc.transform(test_df, is_train=False)
@@ -235,12 +311,23 @@ def generate_submission(train_df, report):
     xt_featurizer = report.get('_xt_featurizer')
     base_features = report.get('_base_features', [])
     if xt_featurizer is not None and base_features:
-        print("   Adding cross-target features for test rows")
+        print("   Adding cross-target features for test rows…")
         # Use base features that exist in test_df
         xt_feats = [f for f in base_features if f in test_df.columns]
         test_df = xt_featurizer.transform_test(test_df, xt_feats)
         xt_cols = xt_featurizer.get_feature_names()
         print(f"   Cross-target columns added: {xt_cols}")
+
+    sarimax_preds = {}
+    sarimax_model = report.get('_sarimax')
+    if sarimax_model is not None and dws_context is not None:
+        print("   Generating SARIMAX predictions for test rows…")
+        try:
+            all_dws = dws_context['all_dws']
+            sarimax_preds = sarimax_model.predict_for_rows(test_df, all_dws)
+        except Exception as e:
+            print(f"   Warning: SARIMAX prediction failed (non-fatal): {e}")
+            traceback.print_exc()
 
     # Predict
     for target in config.TARGETS:
@@ -261,7 +348,14 @@ def generate_submission(train_df, report):
         raw = model.predict(np.array(X_test, dtype=np.float64))
 
         preds = np.expm1(raw) if use_log else raw
+        preds = np.nan_to_num(preds, nan=0.0, posinf=0.0, neginf=0.0)
         preds = np.clip(preds, 0, None)
+
+        # Blend with SARIMAX if available
+        if target in sarimax_preds:
+            from sarimax_model import blend_predictions
+            sarx = np.array(sarimax_preds[target], dtype=np.float64)
+            preds = blend_predictions(preds, sarx, blend_weight=0.7)
 
         sub_df[target] = preds
         print(f"   {target}: mean={preds.mean():.2f}  "
