@@ -4,12 +4,7 @@ import numpy as np
 from time import sleep
 
 
-# 1. METEOROLOGY  (Open-Meteo Archive)
 def fetch_weather_history(lat, lon, sample_date):
-    """
-    Historical weather for a specific location + date window.
-    Returns rain, temp, ET, wind, humidity, radiation, water balance.
-    """
     try:
         date_obj = pd.to_datetime(sample_date, dayfirst=True)
         end_date   = date_obj.strftime('%Y-%m-%d')
@@ -90,9 +85,7 @@ def _empty_weather():
     }
 
 
-# 2. SOIL PROPERTIES  (ISRIC SoilGrids)
 def fetch_soil_properties(lat, lon):
-    """SoilGrids REST – often broken / returns no data for SA."""
     try:
         url = "https://rest.isric.org/soilgrids/v2.0/properties/query"
         params = {
@@ -117,8 +110,6 @@ def fetch_soil_properties(lat, lon):
     except Exception:
         return {"soil_clay": np.nan, "soil_phh2o": np.nan, "soil_cec": np.nan}
 
-
-# 3. Wrapper for enrich_dataset
 def fetch_environ_features(row):
     lat, lon = row['Latitude'], row['Longitude']
     date = row['Sample Date']
