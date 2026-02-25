@@ -126,7 +126,7 @@ def _scrape_region_stations():
     for region in _ALL_REGIONS:
         url = (f"https://www.dws.gov.za/iwqs/wms/data/"
                f"{region}_reg_WMS_nobor.htm")
-        print(f"      Scraping region {region}…", end=" ", flush=True)
+        print(f"      Scraping region {region}...", end=" ", flush=True)
         try:
             result = subprocess.run(
                 ["curl", "-sL", "--max-time", "30", url],
@@ -198,7 +198,7 @@ def discover_training_stations(train_csv_path, dws_dir, cache_path=None):
                                   or ".", _DISCOVERY_CACHE)
 
     if os.path.exists(cache_path):
-        print(f"   Loading training-station cache '{cache_path}'…")
+        print(f"   Loading training-station cache '{cache_path}'...")
         with open(cache_path) as f:
             matches = json.load(f)
         registry = {}
@@ -210,7 +210,7 @@ def discover_training_stations(train_csv_path, dws_dir, cache_path=None):
         print(f"   {len(registry)} training-location stations from cache")
         return registry
 
-    print("   No training-station cache — running full DWS discovery…")
+    print("   No training-station cache — running full DWS discovery...")
 
     # Load unique training coordinates
     train_df = pd.read_csv(train_csv_path)
@@ -233,7 +233,7 @@ def discover_training_stations(train_csv_path, dws_dir, cache_path=None):
     os.makedirs(discovery_dir, exist_ok=True)
     station_info = {}  # station: (lat, lon, zip_url, csv_name)
 
-    print(f"   Downloading {len(new_stations)} ZIPs (8 workers)…")
+    print(f"   Downloading {len(new_stations)} ZIPs (8 workers)...")
 
     def _dl_one(item):
         stn, (zu, cn) = item
@@ -391,7 +391,7 @@ def build_station_features(all_dws, cutoff_date=None):
         cutoff_date = pd.Timestamp("2010-12-31")
 
     print(f"   Building station features (data before "
-          f"{cutoff_date.strftime('%Y-%m-%d')}) …")
+          f"{cutoff_date.strftime('%Y-%m-%d')}) ...")
 
     target_dws_cols = list(_COL_FOR_TARGET.values())
     station_feats = {}
