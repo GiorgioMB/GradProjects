@@ -160,7 +160,7 @@ def fetch_temporal_satellite(row, relaxed_mode=False):
             time.sleep(1 + attempt)
 
 
-# 4. ORCHESTRATOR
+# 4.  ORCHESTRATOR
 def enrich_dataset(df, cache_path):
     df['key'] = (
         df['Latitude'].astype(str) + "_" +
@@ -169,9 +169,21 @@ def enrich_dataset(df, cache_path):
     )
     unique_rows = df.drop_duplicates(subset=['key'])
 
+    # PART A:  OSM + Terrain + Weather + Soil
     if os.path.exists(cache_path):
         print(f"   Loading cache '{cache_path}'...")
-        cached_df = pd.read_csv(cache_path)
+        # Robust read: truncate extra trailing fields to expected column count
+        import csv as _csv
+        with open(cache_path) as _f:
+            _reader = _csv.reader(_f)
+            _hdr = next(_reader)
+            _ncols = len(_hdr)
+            _rows = [r[:_ncols] for r in _reader]
+        cached_df = pd.DataFrame(_rows, columns=_hdr)
+        # Convert numeric columns back from strings
+        for _c in cached_df.columns:
+            if _c not in ('Sample Date', 'key'):
+                cached_df[_c] = pd.to_numeric(cached_df[_c], errors='coerce')
         cached_df['key'] = (
             cached_df['Latitude'].astype(str) + "_" +
             cached_df['Longitude'].astype(str) + "_" +
@@ -179,7 +191,7 @@ def enrich_dataset(df, cache_path):
         )
         existing_keys = set(cached_df['key'])
 
-        # Check if cache is missing extended weather columns
+        # Check if cache is missing extended weather columns → rebuild those
         expected_weather = ['et_30d_sum', 'water_balance_30d', 'wind_30d_mean',
                             'humidity_30d_mean', 'radiation_30d_mean']
         missing_cols = [c for c in expected_weather if c not in cached_df.columns]
@@ -246,7 +258,8 @@ def enrich_dataset(df, cache_path):
     df = pd.merge(df, cached_df,
                   on=['Latitude', 'Longitude', 'Sample Date'], how='left')
 
-    # Geo-enrichment (WorldCover, JRC, Geology, Population, Water infrastructure, Water body type)
+    # PART B:  Geo-enrichment (WorldCover, JRC, Geology, Population,
+    #          Water infrastructure, Water body type)
     geo_cache_path = config.GEO_CACHE
 
     df['_geo_key'] = (
@@ -303,7 +316,7 @@ def enrich_dataset(df, cache_path):
             else:
                 geo_cached = new_geo
 
-
+    # Merge Part B
     if not geo_cached.empty:
         for c in ['_geo_key']:
             if c in geo_cached.columns:
