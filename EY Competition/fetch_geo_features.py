@@ -1,4 +1,5 @@
 import numpy as np
+import pandas as pd
 import requests
 import pystac_client
 import planetary_computer
@@ -6,7 +7,7 @@ import rasterio
 from rasterio.windows import from_bounds
 from time import sleep
 
-#  Helpers
+#  Shared helpers
 _PC_CLIENT = None
 
 def _get_pc_client():
@@ -32,7 +33,7 @@ def _safe_read_raster(href, bbox, band=1):
         return None
 
 
-#  1. ESA WorldCover 10 m  (Planetary Computer)
+#  1. ESA WorldCover 10 m  
 _WC_CLASSES = {
     10: 'tree_cover',
     20: 'shrubland',
@@ -83,7 +84,7 @@ def fetch_worldcover(lat, lon, buffer_deg=0.025):
         return empty
 
 
-#  2. JRC Global Surface Water  (Planetary Computer)
+#  2. JRC Global Surface Water
 def fetch_surface_water(lat, lon, buffer_deg=0.025):
     empty = {
         "water_occurrence_mean": np.nan,
@@ -103,7 +104,6 @@ def fetch_surface_water(lat, lon, buffer_deg=0.025):
 
         item = items[0]
 
-        # Occurrence (0-100%: fraction of time water was present)
         occ = _safe_read_raster(item.assets["occurrence"].href, bbox)
         if occ is not None:
             water_pixels = occ[occ > 0]
@@ -115,7 +115,6 @@ def fetch_surface_water(lat, lon, buffer_deg=0.025):
             )
             empty["water_fraction"] = float((occ > 0).sum()) / max(occ.size, 1)
 
-        # Seasonality (months of water presence per year)
         sea = _safe_read_raster(item.assets["seasonality"].href, bbox)
         if sea is not None:
             water_seasonal = sea[sea > 0]
@@ -129,8 +128,7 @@ def fetch_surface_water(lat, lon, buffer_deg=0.025):
         return empty
 
 
-#  3. Geology / Lithology  (Macrostrat REST API) 
-# Map raw lithology strings to broad categories for encoding
+#  3. Geology / Lithology  (Macrostrat REST API)
 _LITH_CATEGORIES = {
     'sedimentary': 0,
     'sedimentary rocks': 0,
@@ -182,6 +180,8 @@ def fetch_geology(lat, lon):
         if not records:
             return empty
 
+        # Use the most detailed record (usually last / highest source_id)
+        # Try to pick the one with a non-empty lith
         best = records[0]
         for rec in records:
             if rec.get("lith") and rec["lith"].strip():
@@ -205,8 +205,7 @@ def fetch_geology(lat, lon):
         return empty
 
 
-#  4. Population Density (GHS-POP via Planetary Computer) 
-#     Fallback to simple calculation from WorldCover built-up fraction
+#  4. Population Density 
 def fetch_population_density(lat, lon, buffer_deg=0.05):
     empty = {
         "pop_density_proxy": np.nan,
@@ -216,6 +215,8 @@ def fetch_population_density(lat, lon, buffer_deg=0.05):
         catalog = _get_pc_client()
         bbox = [lon - buffer_deg, lat - buffer_deg,
                 lon + buffer_deg, lat + buffer_deg]
+
+        # Try GHS-POP (Global Human Settlement Population) if available
         try:
             search = catalog.search(collections=["ghs-pop"], bbox=bbox)
             items = list(search.item_collection())
@@ -228,6 +229,8 @@ def fetch_population_density(lat, lon, buffer_deg=0.05):
                     empty["pop_density_proxy"] = float(np.nanmean(data[data > 0])) if (data > 0).any() else 0.0
         except Exception:
             pass
+
+        # Fallback / complement: WorldCover built-up fraction (wider buffer)
         search = catalog.search(collections=["esa-worldcover"], bbox=bbox)
         items = list(search.item_collection())
         if items:
@@ -242,7 +245,7 @@ def fetch_population_density(lat, lon, buffer_deg=0.05):
         return empty
 
 
-#  5. Water Infrastructure (OSM via osmnx)
+#  5. Water Infrastructure 
 def fetch_water_infrastructure(lat, lon, radius_m=10000):
     empty = {
         "dam_count_10km": 0,
@@ -284,7 +287,7 @@ def fetch_water_infrastructure(lat, lon, radius_m=10000):
             sample_pt = Point(lon, lat)
             # Use centroid for polygons, representative point for lines
             dists = dams_and_res.geometry.apply(
-                lambda g: sample_pt.distance(g.centroid) * 111_320 
+                lambda g: sample_pt.distance(g.centroid) * 111_320  # rough deg->m
             )
             result["nearest_dam_dist_m"] = float(dists.min())
 
@@ -294,7 +297,7 @@ def fetch_water_infrastructure(lat, lon, radius_m=10000):
         return empty
 
 
-#  6. Water Body Type Classification (OSM via osmnx)
+#  6. Water Body Type Classification
 def fetch_water_body_type(lat, lon, radius_m=5000):
     empty = {
         "wbt_river_count": 0,
@@ -345,20 +348,23 @@ def fetch_water_body_type(lat, lon, radius_m=5000):
         return empty
 
 
-#  7. Wrapper for enrich_dataset)
+#  7. Combined fetcher 
 def fetch_geo_features(row):
     lat, lon = row["Latitude"], row["Longitude"]
 
+    # ESA WorldCover (Planetary Computer)
     worldcover = fetch_worldcover(lat, lon)
+
+    # JRC Surface Water (Planetary Computer)
     surface_water = fetch_surface_water(lat, lon)
+
+    # Geology (Macrostrat)
     geology = fetch_geology(lat, lon)
     sleep(0.05)
-  
+
     pop = fetch_population_density(lat, lon)
     infra = fetch_water_infrastructure(lat, lon)
     sleep(0.05)
-
     wbt = fetch_water_body_type(lat, lon)
     sleep(0.05)
-
     return {**worldcover, **surface_water, **geology, **pop, **infra, **wbt}
