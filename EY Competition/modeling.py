@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+import traceback
 import xgboost as xgb
 import warnings
 
@@ -36,8 +37,14 @@ from scipy import stats as sp_stats
 import joblib
 import config
 
+try:
+    from sarimax_model import StationSARIMAX, blend_predictions
+    HAS_SARIMAX = True
+except ImportError:
+    HAS_SARIMAX = False
 
-# 0.  FEATURE ENGINEERING  (only physically meaningful features)
+
+# 0.  FEATURE ENGINEERING  
 def engineer_features(df):
     df = df.copy()
     eps = 1e-8
@@ -147,6 +154,7 @@ def engineer_features(df):
 
     if 'water_balance_30d' in df.columns and 'elevation_mean' in df.columns:
         df['WaterBal_Elev'] = df['water_balance_30d'] * df['elevation_mean']
+    # Humidity_Temp already created in 'Rainfall / weather interactions' above
     if 'water_balance_30d' in df.columns and 'lc_cropland' in df.columns:
         df['WaterBal_Crop'] = df['water_balance_30d'] * df['lc_cropland']
 
@@ -187,6 +195,7 @@ def engineer_features(df):
     return df
 
 
+# 0b.  KNN SPATIAL FEATURES  (gentle spatial prior)
 class SpatialKNNEncoder:
     def __init__(self, targets, k_values=(5, 10, 15, 25)):
         self.targets  = targets
@@ -208,6 +217,7 @@ class SpatialKNNEncoder:
         coords = np.deg2rad(df[['Latitude', 'Longitude']].values)
         max_k = max(self.k_values)
         k_q = max_k + 1 if is_train else max_k
+        # Clamp to number of available training points
         k_q = min(k_q, self.tree_.data.shape[0])
         if k_q < 2:
             return df
@@ -235,17 +245,20 @@ class SpatialKNNEncoder:
                     df[f'{t}_knn{k}_median'] = np.nanmedian(vals, axis=1)
                     df[f'{t}_knn{k}_std']    = np.nanstd(vals, axis=1)
 
+                # Distance-weighted mean
                 w = 1.0 / (dists * 6371.0 + 1.0)
                 valid = ~np.isnan(vals)
                 wv = np.where(valid, vals * w, 0.0)
                 ws = np.where(valid, w, 0.0)
                 df[f'{t}_knn{k}_wmean'] = wv.sum(axis=1) / (ws.sum(axis=1) + 1e-8)
 
+            # Nearest-neighbour distance
             df[f'{t}_nn_dist_km'] = dists_all[:, 0] * 6371.0
 
         return df
 
 
+# 1.  MODEL CONFIGS 
 def _get_models_for_target(target_name):
     use_log = True  # All targets are right-skewed
 
@@ -303,6 +316,7 @@ def _get_models_for_target(target_name):
         )
         estimators.append(('cb', CatBoostRegressor(**cb_p)))
 
+    # Extra-Trees
     et_pipe = Pipeline([
         ('imputer', SimpleImputer(strategy='median')),
         ('et', ExtraTreesRegressor(
@@ -312,6 +326,7 @@ def _get_models_for_target(target_name):
     ])
     estimators.append(('et', et_pipe))
 
+    # Ridge regression — completely different inductive bias
     ridge_pipe = Pipeline([
         ('imputer', SimpleImputer(strategy='median')),
         ('scaler', StandardScaler()),
@@ -322,13 +337,14 @@ def _get_models_for_target(target_name):
     return estimators, use_log
 
 
+# 2.  WEIGHTED ENSEMBLE  
 class WeightedEnsemble(BaseEstimator, RegressorMixin):
 
     def __init__(self, estimators):
         self.estimators = estimators
 
     def fit(self, X, y, groups=None):
-        X_arr = np.nan_to_num(np.array(X, dtype=np.float64), nan=0.0)
+        X_arr = np.nan_to_num(np.array(X, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
         y_arr = np.array(y, dtype=np.float64)
 
         n_splits = 5
@@ -351,6 +367,7 @@ class WeightedEnsemble(BaseEstimator, RegressorMixin):
                     m = clone(est)
                     m.fit(X_arr[tr], y_arr[tr])
                     preds = m.predict(X_arr[va])
+                    preds = np.nan_to_num(preds, nan=0.0, posinf=0.0, neginf=0.0)
                     fold_r2s.append(max(r2_score(y_arr[va], preds), 0.0))
                 except Exception as e:
                     warnings.warn(f"   {name} failed in fold: {e}")
@@ -360,6 +377,7 @@ class WeightedEnsemble(BaseEstimator, RegressorMixin):
             print(f"      {name:>8s}: OOF R²={mean_r2:.4f} "
                   f"(±{np.std(fold_r2s):.3f})")
 
+        # Compute weights (proportional to R2, floor at 0)
         scores = np.array(model_scores)
         scores = np.maximum(scores, 0.0)
         if scores.sum() > 0:
@@ -369,6 +387,7 @@ class WeightedEnsemble(BaseEstimator, RegressorMixin):
 
         print(f"      Weights: {dict(zip([n for n,_ in self.estimators], [f'{w:.3f}' for w in self.weights_]))}")
 
+        # Fit all models on full data
         self.fitted_models_ = []
         self.model_names_   = []
         for name, est in self.estimators:
@@ -380,15 +399,18 @@ class WeightedEnsemble(BaseEstimator, RegressorMixin):
         return self
 
     def predict(self, X):
-        X_arr = np.nan_to_num(np.array(X, dtype=np.float64), nan=0.0)
+        X_arr = np.nan_to_num(np.array(X, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
         preds = np.zeros(len(X_arr))
         for m, w in zip(self.fitted_models_, self.weights_):
-            preds += w * m.predict(X_arr)
+            p = np.nan_to_num(m.predict(X_arr), nan=0.0, posinf=0.0, neginf=0.0)
+            preds += w * p
         return preds
 
 
+# 3.  EVALUATION  (spatial CV with per-fold KNN)
 def evaluate_model(df_full, features, target, groups, estimators, use_log,
                    knn_targets):
+
     print(f"\n   Evaluating {target} (spatial CV, log={use_log})…")
 
     y_arr = df_full[target].values.astype(np.float64)
@@ -420,8 +442,8 @@ def evaluate_model(df_full, features, target, groups, estimators, use_log,
         all_feats = [f for f in all_feats if f not in config.TARGETS]
         all_feats = list(dict.fromkeys(all_feats))
 
-        X_tr = np.nan_to_num(np.array(df_tr[all_feats], dtype=np.float64), nan=0.0)
-        X_te = np.nan_to_num(np.array(df_te[all_feats], dtype=np.float64), nan=0.0)
+        X_tr = np.nan_to_num(np.array(df_tr[all_feats], dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+        X_te = np.nan_to_num(np.array(df_te[all_feats], dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
 
         y_fit = np.log1p(np.clip(y_tr, 0, None)) if use_log else y_tr
 
@@ -434,7 +456,9 @@ def evaluate_model(df_full, features, target, groups, estimators, use_log,
 
         preds_raw = ens.predict(X_te)
         preds = np.expm1(preds_raw) if use_log else preds_raw
-        preds = np.clip(preds, 0, None)
+        y_cap = float(np.max(y_tr)) * 2          # safety cap
+        preds = np.clip(preds, 0, y_cap)
+        preds = np.nan_to_num(preds, nan=0.0, posinf=y_cap, neginf=0.0)
 
         r2  = r2_score(y_te, preds)
         rmse = np.sqrt(mean_squared_error(y_te, preds))
@@ -445,13 +469,14 @@ def evaluate_model(df_full, features, target, groups, estimators, use_log,
         tr_p = ens.predict(X_tr)
         if use_log:
             tr_p = np.expm1(tr_p)
-        tr_r2 = r2_score(y_tr, np.clip(tr_p, 0, None))
+        tr_p = np.nan_to_num(np.clip(tr_p, 0, y_cap), nan=0.0, posinf=y_cap, neginf=0.0)
+        tr_r2 = r2_score(y_tr, tr_p)
         fold_train_r2.append(tr_r2)
         gap = tr_r2 - r2
         print(f"      Fold {fi+1}: Train R²={tr_r2:.4f}  Test R²={r2:.4f}  "
               f"Gap={gap:.4f}  RMSE={rmse:.1f}")
         if gap > 0.3:
-            print(f"      ⚠ WARNING: Train-Test gap > 0.3 → overfitting!")
+            print(f"      WARNING: Train-Test gap > 0.3 -> overfitting!")
 
     mr2 = np.mean(fold_r2)
     mg  = np.mean(fold_train_r2) - mr2
@@ -461,11 +486,8 @@ def evaluate_model(df_full, features, target, groups, estimators, use_log,
     return mr2, np.mean(fold_rmse)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # 4.  FEATURE IMPORTANCE PRUNING
-# ─────────────────────────────────────────────────────────────────────────────
 def prune_features(X, y, features, use_log, min_features=50):
-    """Quick XGB fit → drop zero-importance features, but keep at least min_features."""
     y_fit = np.log1p(np.clip(y, 0, None)) if use_log else y
     m = xgb.XGBRegressor(
         n_estimators=200, learning_rate=0.05, max_depth=4,
@@ -473,16 +495,14 @@ def prune_features(X, y, features, use_log, min_features=50):
         tree_method='hist', random_state=42, n_jobs=-1,
     )
     X_arr = np.array(X, dtype=np.float64)
-    X_arr = np.nan_to_num(X_arr, nan=0.0)
+    X_arr = np.nan_to_num(X_arr, nan=0.0, posinf=0.0, neginf=0.0)
     m.fit(X_arr, np.array(y_fit, dtype=np.float64))
     imps = m.feature_importances_
 
-    # Sort by importance, keep at least min_features
     feat_imp = sorted(zip(features, imps), key=lambda x: x[1], reverse=True)
     keep = [f for f, i in feat_imp if i > 0]
     dropped = [f for f, i in feat_imp if i == 0]
 
-    # If pruning would drop below min_features, add back the dropped ones
     if len(keep) < min_features and len(features) >= min_features:
         need = min_features - len(keep)
         keep.extend(dropped[:need])
@@ -495,8 +515,9 @@ def prune_features(X, y, features, use_log, min_features=50):
     print(f"   Keeping {len(keep)} features (min target: {min_features})")
     return keep
 
+
+# 4b. CROSS-TARGET FEATURES  (exploit inter-target correlations)
 def check_target_correlations(df, targets):
-    """Print pairwise Pearson & Spearman correlations between targets."""
     present = [t for t in targets if t in df.columns]
     if len(present) < 2:
         print("   Only one target present — skipping correlation check.")
@@ -509,11 +530,11 @@ def check_target_correlations(df, targets):
         return {}
 
     corr_info = {}
-    print("   ┌─────────────────────────────────────────────────────────────────┐")
-    print("   │              Target–Target Correlations                        │")
-    print("   ├───────────────────────────┬──────────┬───────────┬─────────────┤")
-    print("   │ Pair                      │ Pearson  │ Spearman  │ Exploitable │")
-    print("   ├───────────────────────────┼──────────┼───────────┼─────────────┤")
+    print("   ┌────────────────────────────────────────────────────────────────────┐")
+    print("   │                  Target–Target Correlations                        │")
+    print("   ├───────────────────────────────┬──────────┬───────────┬─────────────┤")
+    print("   │ Pair                          │ Pearson  │ Spearman  │ Exploitable │")
+    print("   ├───────────────────────────────┼──────────┼───────────┼─────────────┤")
     for i in range(len(present)):
         for j in range(i + 1, len(present)):
             t1, t2 = present[i], present[j]
@@ -521,20 +542,21 @@ def check_target_correlations(df, targets):
             pearson_r, _ = sp_stats.pearsonr(pair[t1], pair[t2])
             spearman_r, _ = sp_stats.spearmanr(pair[t1], pair[t2])
             exploitable = abs(spearman_r) > 0.15
-            flag = "✅ YES" if exploitable else "❌ NO"
+            flag = " YES" if exploitable else " NO"
+            # Truncate names for display
             n1 = t1[:12]
             n2 = t2[:12]
-            label = f"{n1}↔{n2}"
+            label = f"{n1}<->{n2}"
             print(f"   │ {label:<25s} │ {pearson_r:>+7.3f}  │ {spearman_r:>+8.3f}  │ {flag:>11s} │")
             corr_info[(t1, t2)] = {
                 'pearson': pearson_r, 'spearman': spearman_r,
                 'exploitable': exploitable,
             }
-    print("   └───────────────────────────┴──────────┴───────────┴─────────────┘")
+    print("   └───────────────────────────────┴──────────┴───────────┴─────────────┘")
 
     any_exploit = any(v['exploitable'] for v in corr_info.values())
     if any_exploit:
-        print("   At least one pair has Spearman rho > 0.15 -> enabling cross-target features.")
+        print("   At least one pair has |Spearman rho| > 0.15 -> enabling cross-target features.")
     else:
         print("   No strong cross-target correlations -> cross-target features would add noise.")
     return corr_info
@@ -545,8 +567,8 @@ class CrossTargetFeaturizer:
     def __init__(self, targets, enabled_pairs=None):
         self.targets = targets
         self.enabled_pairs = enabled_pairs
-        self.fitted_models_ = {}   
-        self.oof_predictions_ = {} 
+        self.fitted_models_ = {}   # target → fitted model
+        self.oof_predictions_ = {} # target → OOF array (indexed like df)
 
     def _is_useful(self, src_target, dst_target):
         if self.enabled_pairs is None:
@@ -558,8 +580,8 @@ class CrossTargetFeaturizer:
 
     def fit_oof(self, df, features, groups):
         df = df.copy()
-        self.features_ = list(features)
-        X = np.nan_to_num(np.array(df[features], dtype=np.float64), nan=0.0)
+        self.features_ = list(features)  # Save for test-time alignment
+        X = np.nan_to_num(np.array(df[features], dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
         g = np.array(groups)
         n_groups = len(set(g))
         n_splits = min(5, n_groups)
@@ -578,13 +600,17 @@ class CrossTargetFeaturizer:
             if mask.sum() < 50:
                 continue
 
+            # Lightweight Ridge pipeline for OOF
             pipe = Pipeline([
                 ('imputer', SimpleImputer(strategy='median')),
                 ('scaler', StandardScaler()),
                 ('ridge', Ridge(alpha=10.0)),
             ])
+
+            # Generate OOF predictions
             oof = np.full(len(df), np.nan)
             for tri, tei in gkf.split(X, y, g):
+                # Only fit on rows where target is not NaN
                 tri_valid = tri[mask[tri]]
                 if len(tri_valid) < 10:
                     continue
@@ -626,7 +652,7 @@ class CrossTargetFeaturizer:
         for f in aligned_feats:
             if f not in test_df.columns:
                 test_df[f] = np.nan
-        X = np.nan_to_num(np.array(test_df[aligned_feats], dtype=np.float64), nan=0.0)
+        X = np.nan_to_num(np.array(test_df[aligned_feats], dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
 
         for t in self.targets:
             if t not in self.fitted_models_:
@@ -644,13 +670,15 @@ class CrossTargetFeaturizer:
         return list(dict.fromkeys(names))
 
 
+# 5.  OPTUNA SEARCH  (conservative search space)
 def _optuna_search(X, y, groups, use_log, target_name, n_trials=30):
     if not HAS_OPTUNA:
+        print("   Optuna not installed – using default hyperparams.")
         return None
 
-    print(f"   Running Optuna ({n_trials} trials, conservative bounds)")
+    print(f"   Running Optuna ({n_trials} trials, conservative bounds)…")
     y_fit = np.log1p(np.clip(y, 0, None)) if use_log else y
-    X_arr = np.nan_to_num(np.array(X, dtype=np.float64), nan=0.0)
+    X_arr = np.nan_to_num(np.array(X, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
     y_arr = np.array(y_fit, dtype=np.float64)
     g_arr = np.array(groups)
 
@@ -682,7 +710,10 @@ def _optuna_search(X, y, groups, use_log, target_name, n_trials=30):
                 y_real = np.expm1(y_arr[va])
             else:
                 preds_real, y_real = preds, y_arr[va]
-            scores.append(r2_score(y_real, np.clip(preds_real, 0, None)))
+            y_cap_opt = float(np.max(y_real)) * 2
+            preds_real = np.nan_to_num(np.clip(preds_real, 0, y_cap_opt),
+                                       nan=0.0, posinf=y_cap_opt, neginf=0.0)
+            scores.append(r2_score(y_real, preds_real))
         return np.mean(scores)
 
     study = optuna.create_study(direction='maximize',
@@ -690,6 +721,7 @@ def _optuna_search(X, y, groups, use_log, target_name, n_trials=30):
     study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
 
     best = study.best_params
+    # Rename back from short names
     best['learning_rate'] = best.pop('lr')
     best['min_child_weight'] = best.pop('mcw')
     best['colsample_bytree'] = best.pop('colsample')
@@ -701,15 +733,52 @@ def _optuna_search(X, y, groups, use_log, target_name, n_trials=30):
     return best
 
 
-def train_models(df, log_transform=None, use_optuna=True):
-    print("\n Feature Engineering")
+# 6.  MAIN ENTRY POINT
+def train_models(df, log_transform=None, use_optuna=True, dws_context=None):
+    print("\n== Feature Engineering ==")
     df = engineer_features(df)
 
-    print("\n Cross-Target Correlation Analysis")
+    if dws_context is not None:
+        import dws_data as dws_mod
+
+        all_dws          = dws_context['all_dws']
+        station_features = dws_context['station_features']
+        aug_rows         = dws_context['aug_rows']
+
+        print("\n== DWS Integration ==")
+
+        # 1. Add augmented training rows from DWS
+        if aug_rows is not None and len(aug_rows) > 0:
+            aug = aug_rows.copy()
+            aug = engineer_features(aug)
+            pre_len = len(df)
+            df = pd.concat([df, aug], ignore_index=True)
+            print(f"   Augmented training: {pre_len} -> {len(df)} rows "
+                  f"(+{len(aug)} DWS rows at test locations)")
+
+        # 2. Assign DWS station codes
+        df['_dws_station'] = df.apply(
+            lambda r: dws_mod.coord_to_station(r['Latitude'], r['Longitude']),
+            axis=1,
+        )
+        n_matched = df['_dws_station'].notna().sum()
+        print(f"   DWS station match: {n_matched}/{len(df)} rows")
+
+        # 3. Merge station-level features (IDW for non-matched rows)
+        df = dws_mod.merge_station_features(df, station_features)
+
+        # 4. Add per-row lag features
+        df = dws_mod.add_lag_features(df, all_dws, config.TARGETS)
+
+        # 5. Add same-day auxiliary features to ALL training rows
+        df = dws_mod.add_sameday_aux_features(df, all_dws)
+
+    print("\n== Cross-Target Correlation Analysis ==")
     corr_info = check_target_correlations(df, config.TARGETS)
     use_cross_target = any(v['exploitable'] for v in corr_info.values()) if corr_info else False
 
-    print("\n KNN Spatial Features")
+    # KNN 
+    print("\n== KNN Spatial Features ==")
     knn_enc = SpatialKNNEncoder(config.TARGETS, k_values=(5, 10, 15, 25))
     knn_enc.fit(df)
     df_with_knn = knn_enc.transform(df, is_train=True)
@@ -717,8 +786,10 @@ def train_models(df, log_transform=None, use_optuna=True):
                 if '_knn' in c or '_nn_dist' in c]
     print(f"   Added {len(knn_cols)} KNN features")
 
+    # Feature selection
     always_drop = ['Sample Date', 'key', '_dt', '_loc_id', '_enc_loc_id',
-                   '_is_missing', '_geo_key', 'Latitude', 'Longitude']
+                   '_is_missing', '_geo_key', 'Latitude', 'Longitude',
+                   '_dws_station', 'date', 'station']
     dead_feats = getattr(config, 'DEAD_FEATURES', [])
     drop_cols = config.TARGETS + always_drop + dead_feats
     base_features = [c for c in df.columns
@@ -726,9 +797,11 @@ def train_models(df, log_transform=None, use_optuna=True):
                      and pd.api.types.is_numeric_dtype(df[c])]
     print(f"   Base features ({len(base_features)}): {base_features[:15]}...")
 
+    # ── Cross-target OOF features ────────────────────────────────────────
     xt_featurizer = None
     if use_cross_target:
         print("\n══ Cross-Target OOF Features ══")
+        # Use full df with all rows to generate OOF cross-target predictions
         groups_all = (df['Latitude'].round(2).astype(str) + "_" +
                       df['Longitude'].round(2).astype(str))
         xt_featurizer = CrossTargetFeaturizer(
@@ -743,6 +816,7 @@ def train_models(df, log_transform=None, use_optuna=True):
         '_knn_encoder': knn_enc,
         '_xt_featurizer': xt_featurizer,
         '_base_features': base_features,
+        '_dws_context': dws_context,
     }
 
     for target in config.TARGETS:
@@ -762,7 +836,7 @@ def train_models(df, log_transform=None, use_optuna=True):
 
         y = tdf[target].copy()
 
-        # Winsorise
+        # Winsorise at 1st/99th percentile
         lo, hi = y.quantile(0.01), y.quantile(0.99)
         y = y.clip(lower=lo, upper=hi)
         tdf[target] = y
@@ -775,13 +849,14 @@ def train_models(df, log_transform=None, use_optuna=True):
               f"skew={y.skew():.2f}  log={use_log}")
         print(f"   y range: [{y.min():.1f}, {y.max():.1f}] (winsorised)")
 
+        # Cross-target features relevant for THIS target
         xt_feats_for_target = [c for c in xt_cols
                                if c in tdf.columns
                                and c != f'xt_{target[:8].replace(" ", "")}']
         if xt_feats_for_target:
             print(f"   Cross-target features for this target: {xt_feats_for_target}")
 
-        # Prune 
+        # Prune
         X_base = tdf[base_features]
         tgt_base_feats = prune_features(X_base, y, base_features, use_log)
         tgt_base_feats = tgt_base_feats + xt_feats_for_target  # always include xt features
@@ -808,7 +883,7 @@ def train_models(df, log_transform=None, use_optuna=True):
         r2, rmse = evaluate_model(tdf, tgt_base_feats, target, groups,
                                    estimators, use_log, config.TARGETS)
 
-        print("   Training final model on ALL data")
+        print("   Training final model on ALL data…")
         tdf_final = knn_enc.transform(tdf, is_train=True)
         all_feats = [f for f in tdf_final.columns
                      if (f in tgt_base_feats
@@ -819,7 +894,7 @@ def train_models(df, log_transform=None, use_optuna=True):
         y_fit = (np.log1p(np.clip(y, 0, None)) if use_log
                  else np.array(y, dtype=np.float64))
         final = WeightedEnsemble(estimators)
-        final.fit(np.nan_to_num(np.array(tdf_final[all_feats], dtype=np.float64), nan=0.0),
+        final.fit(np.nan_to_num(np.array(tdf_final[all_feats], dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0),
                   np.array(y_fit, dtype=np.float64),
                   groups=np.array(groups))
 
@@ -840,13 +915,35 @@ def train_models(df, log_transform=None, use_optuna=True):
         joblib.dump(xt_featurizer, "cross_target_featurizer.joblib")
         print("   Saved cross_target_featurizer.joblib")
 
+    sarimax_fitted = None
+    if HAS_SARIMAX and dws_context is not None:
+        all_dws = dws_context.get('all_dws')
+        if all_dws and len(all_dws) > 0:
+            try:
+                sarimax_fitted = StationSARIMAX(
+                    config.TARGETS, n_optuna_trials=20)
+                sarimax_fitted.fit(all_dws)
+                sarimax_cv = sarimax_fitted.evaluate_cv(all_dws)
+                joblib.dump(sarimax_fitted, "sarimax_models.joblib")
+                print("   Saved sarimax_models.joblib")
+            except Exception as e:
+                print(f"   Warning: SARIMAX fitting failed (non-fatal): {e}")
+                traceback.print_exc()
+                sarimax_fitted = None
+
+    performance_report['_sarimax'] = sarimax_fitted
+
     print(f"\n{'='*65}")
     print("   FINAL CV RESULTS")
     print(f"{'='*65}")
     for t in config.TARGETS:
         if t in performance_report:
             m = performance_report[t]
-            print(f"   {t:>35s}:  R²={m['R2']:.3f}  RMSE={m['RMSE']:.1f}  "
-                  f"log={m['log_transform']}")
+            sarimax_tag = ""
+            if sarimax_fitted is not None and hasattr(sarimax_fitted, 'models_'):
+                n_sarimax = sum(1 for k in sarimax_fitted.models_ if k[1] == t)
+                sarimax_tag = f"  SARIMAX={n_sarimax}stn"
+            print(f"   {t:>35s}:  R2={m['R2']:.3f}  RMSE={m['RMSE']:.1f}  "
+                  f"log={m['log_transform']}{sarimax_tag}")
 
     return performance_report
