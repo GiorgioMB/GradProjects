@@ -24,8 +24,11 @@ TARGETS = [
 
 # Feature groups (for reference)
 DEAD_FEATURES = [
-    'soil_clay', 'soil_phh2o', 'soil_cec',           # SoilGrids 99.9 % NaN
+    'soil_cec',                                       # SoilGrids 99.8 % NaN
     'lc_snow_ice', 'lc_mangroves', 'lc_moss_lichen', # Always 0 in South Africa
+    'pop_density_proxy', 'nearest_dam_dist_m',        # 100 % NaN (enrichment failed)
+    'dam_count_10km', 'reservoir_count_10km',         # Constant (1 unique value)
+    'has_dam_nearby',                                 # Constant (1 unique value)
 ]
 
 EXTENDED_WEATHER = [
