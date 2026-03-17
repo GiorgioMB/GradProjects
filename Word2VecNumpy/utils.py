@@ -1,5 +1,5 @@
 """
-utils.py — Small helper utilities.
+utils.py - Small helper utilities.
 """
 
 from __future__ import annotations
@@ -19,9 +19,9 @@ def save_embeddings(
 ) -> None:
     """Save trained embeddings to ``out_dir`` in two formats.
 
-    1. NumPy binary (``embeddings.npy`` + ``vocab.txt``) —
+    1. NumPy binary (``embeddings.npy`` + ``vocab.txt``) -
        fast to reload for downstream use.
-    2. Plain-text (``embeddings.txt``) — one line per word,
+    2. Plain-text (``embeddings.txt``) - one line per word,
        compatible with tools that read GloVe-format files.
 
     Parameters
