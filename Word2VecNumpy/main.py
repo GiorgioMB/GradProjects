@@ -82,8 +82,8 @@ def main() -> None:
     # Evaluate
     print("\n")
     embeddings = model.get_embeddings()
-    nearest_neighbours(embeddings, vocab, top_k=config.TOP_K)
-    word_analogies(embeddings, vocab, top_k=config.TOP_K)
+    nearest_neighbours(embeddings, vocab, top_k=config.TOP_K_NEIGHBOURS)
+    word_analogies(embeddings, vocab, top_k=config.TOP_K_ANALOGIES)
 
     print("Done.")
 
