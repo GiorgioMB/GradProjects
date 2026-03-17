@@ -1,5 +1,5 @@
 """
-train.py — Training loop for Skip-Gram with Negative Sampling.
+train.py - Training loop for Skip-Gram with Negative Sampling.
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ def _linear_lr(
     initial_lr : float
         Starting learning rate.
     min_lr : float
-        Floor — LR will not drop below this.
+        Floor - LR will not drop below this.
     progress : float
         Fraction of total training completed, in [0, 1].
 
