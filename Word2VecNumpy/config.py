@@ -22,8 +22,22 @@ actual window is sampled uniformly from [1, WINDOW_SIZE]."""
 NUM_NEGATIVES: int = 5
 """Number of negative samples drawn per (center, context) positive pair."""
 
-EPOCHS: int = 5
+EPOCHS: int = 10
 """Number of full passes through the corpus."""
+
+TOP_K_NEIGHBOURS: int = 25
+"""
+How many nearest-neighbour candidates to print for each query word.
+Higher values make evaluation more relaxed (related words can appear
+lower in the ranking instead of only in the very top positions).
+"""
+
+TOP_K_ANALOGIES: int = 20
+"""
+How many analogy candidates to inspect for each A - B + C query.
+Higher values make analogy scoring more forgiving because the expected
+answer can match anywhere within a larger top-k set.
+"""
 
 LEARNING_RATE: float = 0.1
 """Initial learning rate for SGD."""
