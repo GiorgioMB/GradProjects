@@ -1,5 +1,5 @@
 """
-data.py - Corpus loading, vocabulary construction, subsampling,
+Corpus loading, vocabulary construction, subsampling,
 negative-sampling table, and training-pair generation.
 
 Pipeline:
@@ -12,16 +12,30 @@ generate_batches    -> Yield mini-batches of (center, context, negatives).
 from __future__ import annotations
 import os
 import re
+import shutil
 import urllib.request
+from urllib.error import HTTPError, URLError
 import zipfile
 from collections import Counter
 from typing import Generator
 import numpy as np
 import config
 
-_WIKITEXT2_URL = (
-    "https://s3.amazonaws.com/research.metamind.io/wikitext/wikitext-2-v1.zip"
+_WIKITEXT2_URLS = (
+    "https://wikitext.smerity.com/wikitext-2-v1.zip",
+    "https://s3.amazonaws.com/research.metamind.io/wikitext/wikitext-2-v1.zip",
 )
+
+
+def _download_file(url: str, output_path: str) -> None:
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "word2vec-training-script/1.0"},
+    )
+    with urllib.request.urlopen(req, timeout=60) as response, open(
+        output_path, "wb"
+    ) as out_file:
+        shutil.copyfileobj(response, out_file)
 
 def _download_wikitext2(data_dir: str) -> str:
     os.makedirs(data_dir, exist_ok=True)
@@ -32,9 +46,28 @@ def _download_wikitext2(data_dir: str) -> str:
     if os.path.isfile(train_path):
         return train_path
 
-    if not os.path.isfile(zip_path):
+    if not os.path.isfile(zip_path) or not zipfile.is_zipfile(zip_path):
+        if os.path.isfile(zip_path):
+            print(f"[data] Removing invalid archive: {zip_path}")
+            os.remove(zip_path)
+
         print(f"[data] Downloading WikiText-2, {zip_path}")
-        urllib.request.urlretrieve(_WIKITEXT2_URL, zip_path)
+        last_error: Exception | None = None
+        for url in _WIKITEXT2_URLS:
+            try:
+                print(f"[data] Trying: {url}")
+                _download_file(url, zip_path)
+                if not zipfile.is_zipfile(zip_path):
+                    raise zipfile.BadZipFile("Downloaded file is not a valid zip")
+                break
+            except (HTTPError, URLError, TimeoutError, zipfile.BadZipFile) as err:
+                last_error = err
+                if os.path.isfile(zip_path):
+                    os.remove(zip_path)
+        else:
+            raise RuntimeError(
+                "Failed to download WikiText-2 from all known URLs"
+            ) from last_error
 
     print(f"[data] Extracting, {extract_dir}")
     with zipfile.ZipFile(zip_path, "r") as zf:
