@@ -25,7 +25,7 @@ NUM_NEGATIVES: int = 5
 EPOCHS: int = 5
 """Number of full passes through the corpus."""
 
-LEARNING_RATE: float = 0.025
+LEARNING_RATE: float = 0.1
 """Initial learning rate for SGD."""
 
 MIN_LR: float = 1e-4
