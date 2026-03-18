@@ -29,7 +29,7 @@ def _sigmoid(x: np.ndarray) -> np.ndarray:
     Returns
     -------
     np.ndarray
-        f(x) \in (0, 1), same shape as input.
+        f(x) in (0, 1), same shape as input.
     """
     pos_mask = x >= 0
     z = np.zeros_like(x)
@@ -165,10 +165,10 @@ class SkipGramNS:
     def get_embeddings(self) -> np.ndarray:
         """Return the final word embeddings.
 
-        Following common practice, we return only the center embedding
-        matrix ``W_center``.
+        Following common SGNS practice, we return the sum of center and
+        context embeddings.
         Returns
         -------
         np.ndarray, shape ``(vocab_size, embed_dim)``
         """
-        return self.W_center.copy()
+        return (self.W_center + self.W_context).copy()
