@@ -1,5 +1,5 @@
 """
-Corpus loading, vocabulary construction, subsampling,
+data.py - Corpus loading, vocabulary construction, subsampling,
 negative-sampling table, and training-pair generation.
 
 Pipeline:
