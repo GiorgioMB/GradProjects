@@ -103,7 +103,6 @@ DEFAULT_ANALOGIES = [
     ("good", "best", "bad", "worst"),
 ]
 
-
 def word_analogies(
     embeddings: np.ndarray,
     vocab: Vocabulary,
@@ -114,7 +113,7 @@ def word_analogies(
 
     For each analogy ``(A, B, C, D)``, compute
 
-        v = emb(A) - emb(B) + emb(C)
+        v = emb(B) - emb(A) + emb(C)
 
     and check whether ``D`` appears among the *top_k* nearest words
     to ``v`` (excluding A, B, C).
@@ -148,7 +147,7 @@ def word_analogies(
 
         total += 1
         ids = [vocab.word2id[w] for w in (a, b, c)]
-        vec = normed[ids[0]] - normed[ids[1]] + normed[ids[2]]
+        vec = normed[ids[1]] - normed[ids[0]] + normed[ids[2]]
 
         # Normalise the query
         vec /= max(np.linalg.norm(vec), 1e-12)
@@ -165,7 +164,7 @@ def word_analogies(
         hits += int(found)
         mark = "✓" if found else "✗"
         print(
-            f"  {mark}  {a} - {b} + {c} = "
+            f"  {mark}  {b} - {a} + {c} = "
             f"{top_words[0]}  (expected: {expected})  "
             f"top-{top_k}: {top_words}"
         )
