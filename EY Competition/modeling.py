@@ -1,4 +1,34 @@
+"""
+modeling.py  –  Water-quality prediction modelling (v6 – DWS-CENTRIC)
+
+Key insight:  ALL 24 test locations are DWS monitoring stations with
+rich historical chemistry data.  Zero training locations overlap with
+test locations (nearest is 89+ km away).
+
+Architecture change from v5:
+──────────────────────────────────────────────────────────────────────
+ •  PRIMARY training data = DWS measurements at all 24 test-location
+    stations (16K+ rows of water chemistry).  This gives the model
+    direct experience with every test location.
+ •  PRIMARY features = same-day auxiliary DWS chemistry (pH, Ca, Mg,
+    Na, Cl, SO4, Si, NH4, NO3, F, K, DMS) + lag features + station
+    historical statistics + seasonal signals.
+ •  SECONDARY features = satellite, terrain, weather, land cover
+    (available for both DWS rows and competition rows).
+ •  Competition training data (9K rows at 162 non-test locations) is
+    used to add diversity and improve generalisation, NOT as the
+    primary signal.
+ •  Leave-station-out CV (GroupKFold on station) to simulate test.
+ •  Weighted ensemble: XGBoost, LightGBM, CatBoost, ExtraTrees, Ridge.
+
+DWS aux → target correlations (Spearman ρ):
+  EC  ← Na (0.99), DMS (0.99), Mg (0.98), Cl (0.92), SO4 (0.91)
+  TAL ← F (0.80), DMS (0.76), Mg (0.76), Ca (0.76), pH (0.63)
+  DRP ← P_Tot (0.67), NO3 (0.37), F (0.33), Si (0.31)
+"""
+
 import numpy as np
+import os
 import pandas as pd
 import traceback
 import xgboost as xgb
@@ -25,10 +55,11 @@ except ImportError:
     HAS_OPTUNA = False
 
 from sklearn.base import BaseEstimator, RegressorMixin, clone
-from sklearn.ensemble import ExtraTreesRegressor
-from sklearn.linear_model import Ridge
+from sklearn.ensemble import ExtraTreesRegressor, HistGradientBoostingRegressor
+from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.linear_model import Ridge, RidgeCV, ElasticNetCV, ElasticNet
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, PowerTransformer, PolynomialFeatures
 from sklearn.impute import SimpleImputer
 from sklearn.model_selection import GroupKFold
 from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
@@ -37,63 +68,65 @@ from scipy import stats as sp_stats
 import joblib
 import config
 
-try:
-    from sarimax_model import StationSARIMAX, blend_predictions
-    HAS_SARIMAX = True
-except ImportError:
-    HAS_SARIMAX = False
+# ── Multi-target chaining order ──────────────────────────────────────────────
+# EC first (strongest aux correlations), then TAL, then DRP (weakest, benefits
+# from EC/TAL predictions as features).
+CHAIN_ORDER = [
+    'Electrical Conductance',
+    'Total Alkalinity',
+    'Dissolved Reactive Phosphorus',
+]
 
-
-# 0.  FEATURE ENGINEERING  
+# ─────────────────────────────────────────────────────────────────────────────
+# 0.  FEATURE ENGINEERING
+# ─────────────────────────────────────────────────────────────────────────────
 def engineer_features(df):
+    """
+    Create features available for both DWS rows and competition rows.
+    Temporal, spectral, terrain, weather, and land cover features.
+    """
     df = df.copy()
     eps = 1e-8
 
+    # ── Temporal ─────────────────────────────────────────────────────────
     if 'Sample Date' in df.columns:
         dt = pd.to_datetime(df['Sample Date'], dayfirst=True)
         df['Month']     = dt.dt.month
         df['DayOfYear'] = dt.dt.dayofyear
+        df['Year']      = dt.dt.year
         df['Month_sin']     = np.sin(2 * np.pi * df['Month'] / 12)
         df['Month_cos']     = np.cos(2 * np.pi * df['Month'] / 12)
         df['DayOfYear_sin'] = np.sin(2 * np.pi * df['DayOfYear'] / 365.25)
         df['DayOfYear_cos'] = np.cos(2 * np.pi * df['DayOfYear'] / 365.25)
 
+    # ── Spectral indices ─────────────────────────────────────────────────
     if 'nir08' in df.columns and 'red' in df.columns:
-        df['NDVI'] = ((df['nir08'] - df['red']) /
-                      (df['nir08'] + df['red'] + eps))
+        df['NDVI'] = (df['nir08'] - df['red']) / (df['nir08'] + df['red'] + eps)
     if 'green' in df.columns and 'nir08' in df.columns:
-        df['NDWI'] = ((df['green'] - df['nir08']) /
-                      (df['green'] + df['nir08'] + eps))
+        df['NDWI'] = (df['green'] - df['nir08']) / (df['green'] + df['nir08'] + eps)
     if 'nir08' in df.columns and 'swir16' in df.columns:
-        df['NDMI_calc'] = ((df['nir08'] - df['swir16']) /
-                           (df['nir08'] + df['swir16'] + eps))
+        df['NDMI_calc'] = (df['nir08'] - df['swir16']) / (df['nir08'] + df['swir16'] + eps)
     if 'red' in df.columns and 'green' in df.columns:
         df['Turbidity_proxy'] = df['red'] / (df['green'] + eps)
     if 'nir08' in df.columns and 'red' in df.columns:
         df['Chl_proxy'] = df['nir08'] / (df['red'] + eps)
-    if 'nir08' in df.columns and 'green' in df.columns:
-        df['NIR_Green_ratio'] = df['nir08'] / (df['green'] + eps)
     if all(c in df.columns for c in ['swir16', 'red', 'nir08', 'green']):
         df['BSI'] = (((df['swir16'] + df['red']) - (df['nir08'] + df['green'])) /
                      ((df['swir16'] + df['red']) + (df['nir08'] + df['green']) + eps))
-    if 'swir16' in df.columns and 'swir22' in df.columns:
-        df['SWIR_ratio'] = df['swir16'] / (df['swir22'] + eps)
-    if 'nir08' in df.columns and 'swir22' in df.columns:
-        df['NBR'] = ((df['nir08'] - df['swir22']) /
-                     (df['nir08'] + df['swir22'] + eps))
-    if 'green' in df.columns and 'red' in df.columns:
-        df['Green_Red_ratio'] = df['green'] / (df['red'] + eps)
 
+    # ── Elevation / slope ────────────────────────────────────────────────
     if 'elevation_mean' in df.columns:
         df['log_Elev'] = np.log1p(np.clip(df['elevation_mean'], 0, None))
         if 'slope_mean' in df.columns:
             df['Elev_Slope'] = df['elevation_mean'] * df['slope_mean']
 
+    # ── Rainfall ─────────────────────────────────────────────────────────
     if 'rain_7d_sum' in df.columns and 'rain_30d_sum' in df.columns:
         df['Rain_7d_frac'] = df['rain_7d_sum'] / (df['rain_30d_sum'] + eps)
     if 'elevation_mean' in df.columns and 'rain_30d_sum' in df.columns:
         df['Elev_Rain'] = df['elevation_mean'] * df['rain_30d_sum']
 
+    # ── Land cover interactions ──────────────────────────────────────────
     if 'lc_cropland' in df.columns and 'rain_30d_sum' in df.columns:
         df['Cropland_Rain'] = df['lc_cropland'] * df['rain_30d_sum']
     if 'lc_built_up' in df.columns and 'rain_30d_sum' in df.columns:
@@ -107,97 +140,37 @@ def engineer_features(df):
                      df.get('lc_bare_sparse', 0))
         df['Natural_vs_Disturbed'] = natural / (disturbed + eps)
 
-    if 'water_fraction' in df.columns and 'elevation_mean' in df.columns:
-        df['Water_Elev'] = df['water_fraction'] * df['elevation_mean']
+    # ── Geology ──────────────────────────────────────────────────────────
     if 'geo_is_karst' in df.columns and 'rain_30d_sum' in df.columns:
         df['Karst_Rain'] = df['geo_is_karst'] * df['rain_30d_sum']
 
-    if 'green' in df.columns and 'swir16' in df.columns:
-        df['Green_SWIR_ratio'] = df['green'] / (df['swir16'] + eps)
-    if 'red' in df.columns and 'swir22' in df.columns:
-        df['Red_SWIR22_ratio'] = df['red'] / (df['swir22'] + eps)
-    if all(c in df.columns for c in ['green', 'red', 'nir08']):
-        df['Brightness'] = (df['green'] + df['red'] + df['nir08']) / 3.0
-        df['Greenness']  = df['nir08'] - (df['green'] + df['red']) / 2.0
-    if all(c in df.columns for c in ['swir16', 'nir08', 'red']):
-        df['SAVI'] = 1.5 * (df['nir08'] - df['red']) / (df['nir08'] + df['red'] + 0.5 + eps)
-        df['EVI']  = 2.5 * (df['nir08'] - df['red']) / (df['nir08'] + 6*df['red'] - 7.5*0.1*df['swir16'] + 1 + eps)
-    if 'red' in df.columns and 'swir16' in df.columns:
-        df['Red_SWIR16_diff'] = df['red'] - df['swir16']
-
-    if 'elevation_std' in df.columns:
-        df['Terrain_Roughness'] = df['elevation_std']
-    if 'slope_mean' in df.columns:
-        df['log_Slope'] = np.log1p(np.clip(df['slope_mean'], 0, None))
-    if 'aspect_mean' in df.columns:
-        df['Aspect_sin'] = np.sin(np.deg2rad(df['aspect_mean']))
-        df['Aspect_cos'] = np.cos(np.deg2rad(df['aspect_mean']))
-    if 'slope_std' in df.columns:
-        df['Slope_variability'] = df['slope_std']
-    if 'elevation_mean' in df.columns and 'elevation_std' in df.columns:
-        df['Elev_CV'] = df['elevation_std'] / (df['elevation_mean'] + eps)
-
-    if 'rain_30d_sum' in df.columns and 'temp_30d_mean' in df.columns:
-        df['Rain_Temp'] = df['rain_30d_sum'] * df['temp_30d_mean']
-    if 'rain_7d_sum' in df.columns and 'temp_30d_mean' in df.columns:
-        df['Rain7d_Temp'] = df['rain_7d_sum'] * df['temp_30d_mean']
-    if 'et_30d_sum' in df.columns and 'rain_30d_sum' in df.columns:
-        df['ET_Rain_ratio'] = df['et_30d_sum'] / (df['rain_30d_sum'] + eps)
-    if 'et_7d_sum' in df.columns and 'rain_7d_sum' in df.columns:
-        df['ET7d_Rain7d_ratio'] = df['et_7d_sum'] / (df['rain_7d_sum'] + eps)
-    if 'wind_30d_mean' in df.columns and 'rain_30d_sum' in df.columns:
-        df['Wind_Rain'] = df['wind_30d_mean'] * df['rain_30d_sum']
-    if 'radiation_30d_mean' in df.columns and 'temp_30d_mean' in df.columns:
-        df['Radiation_Temp'] = df['radiation_30d_mean'] * df['temp_30d_mean']
-    if 'humidity_30d_mean' in df.columns and 'rain_30d_sum' in df.columns:
-        df['Humidity_Rain'] = df['humidity_30d_mean'] * df['rain_30d_sum']
-
-    if 'water_balance_30d' in df.columns and 'elevation_mean' in df.columns:
-        df['WaterBal_Elev'] = df['water_balance_30d'] * df['elevation_mean']
-    # Humidity_Temp already created in 'Rainfall / weather interactions' above
-    if 'water_balance_30d' in df.columns and 'lc_cropland' in df.columns:
-        df['WaterBal_Crop'] = df['water_balance_30d'] * df['lc_cropland']
-
-    if 'lc_tree_cover' in df.columns and 'rain_30d_sum' in df.columns:
-        df['Forest_Rain'] = df['lc_tree_cover'] * df['rain_30d_sum']
-    if 'lc_grassland' in df.columns and 'rain_30d_sum' in df.columns:
-        df['Grass_Rain'] = df['lc_grassland'] * df['rain_30d_sum']
-    if 'lc_bare_sparse' in df.columns and 'rain_30d_sum' in df.columns:
-        df['Bare_Rain'] = df['lc_bare_sparse'] * df['rain_30d_sum']
-    if 'lc_herbaceous_wetland' in df.columns:
-        df['Wetland_frac'] = df['lc_herbaceous_wetland']
-    if 'lc_water' in df.columns and 'water_fraction' in df.columns:
-        df['LC_Water_x_JRC'] = df['lc_water'] * df['water_fraction']
-    if 'lc_cropland' in df.columns and 'lc_built_up' in df.columns:
-        df['Anthropogenic_total'] = df['lc_cropland'] + df['lc_built_up']
-    if 'lc_cropland' in df.columns and 'elevation_mean' in df.columns:
-        df['Cropland_Elev'] = df['lc_cropland'] * df['elevation_mean']
-
-    if 'water_occurrence_mean' in df.columns and 'rain_30d_sum' in df.columns:
-        df['WaterOcc_Rain'] = df['water_occurrence_mean'] * df['rain_30d_sum']
-    if 'water_seasonality' in df.columns and 'temp_30d_mean' in df.columns:
-        df['WaterSeason_Temp'] = df['water_seasonality'] * df['temp_30d_mean']
+    # ── Dam proximity ────────────────────────────────────────────────────
     if 'nearest_dam_dist_m' in df.columns:
         df['log_Dam_dist'] = np.log1p(np.clip(df['nearest_dam_dist_m'], 0, None))
-
-    if 'geo_lith_category' in df.columns and 'rain_30d_sum' in df.columns:
-        df['Geology_Rain'] = df['geo_lith_category'] * df['rain_30d_sum']
-    if 'geo_rock_age_ma' in df.columns:
-        df['log_RockAge'] = np.log1p(np.clip(df['geo_rock_age_ma'], 0, None))
-    if 'geo_is_karst' in df.columns and 'elevation_mean' in df.columns:
-        df['Karst_Elev'] = df['geo_is_karst'] * df['elevation_mean']
-
-    if 'pop_density_proxy' in df.columns:
-        df['log_PopDensity'] = np.log1p(np.clip(df['pop_density_proxy'], 0, None))
-    if 'pop_built_up_5km' in df.columns and 'rain_30d_sum' in df.columns:
-        df['Urban5km_Rain'] = df['pop_built_up_5km'] * df['rain_30d_sum']
 
     return df
 
 
-# 0b.  KNN SPATIAL FEATURES  (gentle spatial prior)
+# ─────────────────────────────────────────────────────────────────────────────
+# 0b.  KNN SPATIAL FEATURES (chemistry-based, no target leakage)
+# ─────────────────────────────────────────────────────────────────────────────
+# Auxiliary chemistry columns used for KNN features (generalise across stations)
+_KNN_AUX_COLS = [
+    'dws_aux_pH_Diss_Water', 'dws_aux_Ca_Diss_Water',
+    'dws_aux_Mg_Diss_Water', 'dws_aux_Na_Diss_Water',
+    'dws_aux_Cl_Diss_Water', 'dws_aux_SO4_Diss_Water',
+    'dws_aux_F_Diss_Water',  'dws_aux_Si_Diss_Water',
+]
+
 class SpatialKNNEncoder:
-    def __init__(self, targets, k_values=(5, 10, 15, 25)):
+    """KNN from training locations → auxiliary chemistry means + distance.
+
+    v7 change: NO target-mean KNN features (those caused station memorisation
+    and catastrophic OOD failure).  Instead we encode the *chemistry regime*
+    of nearby locations, which generalises because it's the chemistry that
+    drives water quality.
+    """
+    def __init__(self, targets, k_values=(5, 10)):
         self.targets  = targets
         self.k_values = k_values
         self.tree_    = None
@@ -206,10 +179,11 @@ class SpatialKNNEncoder:
         coords = np.deg2rad(df[['Latitude', 'Longitude']].values)
         self.tree_ = BallTree(coords, metric='haversine')
         self.train_coords_ = coords
-        self.train_targets_ = {}
-        for t in self.targets:
-            if t in df.columns:
-                self.train_targets_[t] = df[t].values.copy()
+        # Store auxiliary chemistry values (NOT targets)
+        self.train_aux_ = {}
+        for col in _KNN_AUX_COLS:
+            if col in df.columns:
+                self.train_aux_[col] = df[col].values.copy()
         return self
 
     def transform(self, df, is_train=False):
@@ -217,88 +191,913 @@ class SpatialKNNEncoder:
         coords = np.deg2rad(df[['Latitude', 'Longitude']].values)
         max_k = max(self.k_values)
         k_q = max_k + 1 if is_train else max_k
-        # Clamp to number of available training points
         k_q = min(k_q, self.tree_.data.shape[0])
         if k_q < 2:
             return df
         dists_all, inds_all = self.tree_.query(coords, k=k_q)
-
         if is_train:
             inds_all  = inds_all[:, 1:]
             dists_all = dists_all[:, 1:]
 
-        for t in self.targets:
-            if t not in self.train_targets_:
-                continue
-            y_all = self.train_targets_[t]
-
+        # Chemistry-based KNN: mean of nearby stations' auxiliary chemistry
+        for col in self.train_aux_:
+            short = col.replace('dws_aux_', '').replace('_Diss_Water', '')\
+                       .replace('_Tot_Water', '')
+            y_all = self.train_aux_[col]
             for k in self.k_values:
                 if k > inds_all.shape[1]:
                     continue
-                inds  = inds_all[:, :k]
+                inds = inds_all[:, :k]
                 dists = dists_all[:, :k]
                 vals = y_all[inds]
-
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore")
-                    df[f'{t}_knn{k}_mean']   = np.nanmean(vals, axis=1)
-                    df[f'{t}_knn{k}_median'] = np.nanmedian(vals, axis=1)
-                    df[f'{t}_knn{k}_std']    = np.nanstd(vals, axis=1)
-
-                # Distance-weighted mean
+                    df[f'knn{k}_{short}_mean'] = np.nanmean(vals, axis=1)
+                # IDW weighted mean
                 w = 1.0 / (dists * 6371.0 + 1.0)
                 valid = ~np.isnan(vals)
                 wv = np.where(valid, vals * w, 0.0)
                 ws = np.where(valid, w, 0.0)
-                df[f'{t}_knn{k}_wmean'] = wv.sum(axis=1) / (ws.sum(axis=1) + 1e-8)
+                df[f'knn{k}_{short}_wmean'] = wv.sum(axis=1) / (ws.sum(axis=1) + 1e-8)
 
-            # Nearest-neighbour distance
-            df[f'{t}_nn_dist_km'] = dists_all[:, 0] * 6371.0
-
+        # Nearest-neighbour distance (useful regardless)
+        df['nn_dist_km'] = dists_all[:, 0] * 6371.0
         return df
 
 
-# 1.  MODEL CONFIGS 
+# ─────────────────────────────────────────────────────────────────────────────
+# 0c.  STATION LSTM – temporal model for per-station time series
+# ─────────────────────────────────────────────────────────────────────────────
+try:
+    import torch
+    import torch.nn as nn
+    HAS_TORCH = True
+except ImportError:
+    HAS_TORCH = False
+    torch = None
+    nn = None
+
+class _LSTMNet(nn.Module):
+    """Small LSTM for station time-series regression."""
+    def __init__(self, input_dim, hidden=64, n_layers=2, dropout=0.2):
+        super().__init__()
+        self.lstm = nn.LSTM(input_dim, hidden, n_layers,
+                            batch_first=True, dropout=dropout)
+        self.head = nn.Sequential(
+            nn.Linear(hidden, 32),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(32, 1),
+        )
+
+    def forward(self, x, lengths):
+        # x: (B, T, F), lengths: (B,)
+        packed = nn.utils.rnn.pack_padded_sequence(
+            x, lengths.cpu(), batch_first=True, enforce_sorted=False)
+        _, (h_n, _) = self.lstm(packed)
+        out = self.head(h_n[-1])  # last layer hidden state
+        return out.squeeze(-1)
+
+
+# Sequence features: DWS columns that are available at each timestep
+_LSTM_AUX_COLS = [
+    'Ca_Diss_Water', 'Cl_Diss_Water', 'DMS_Tot_Water',
+    'F_Diss_Water', 'K_Diss_Water', 'Mg_Diss_Water',
+    'Na_Diss_Water', 'NH4_N_Diss_Water', 'NO3_NO2_N_Diss_Water',
+    'P_Tot_Water', 'pH_Diss_Water', 'Si_Diss_Water', 'SO4_Diss_Water',
+]
+
+
+class StationLSTMModel:
+    """
+    Per-station LSTM that learns temporal dynamics from DWS time series.
+
+    For each prediction row at station S on date D:
+      1. Retrieve the DWS time series at S before D
+      2. Build a sequence of [target, aux_chemistry, month_sin, month_cos]
+      3. Feed through LSTM → predict target value
+
+    This captures temporal dynamics (trends, seasonality, regime changes)
+    without memorising station identity.
+    """
+
+    def __init__(self, target_dws_col, target_name, use_log=True,
+                 seq_len=24, hidden=64, n_layers=2, epochs=30,
+                 lr=1e-3, batch_size=256):
+        self.target_dws_col = target_dws_col
+        self.target_name = target_name
+        self.use_log = use_log
+        self.seq_len = seq_len
+        self.hidden = hidden
+        self.n_layers = n_layers
+        self.epochs = epochs
+        self.lr = lr
+        self.batch_size = batch_size
+        self.model_ = None
+        self.feat_means_ = None
+        self.feat_stds_ = None
+        self.n_features_ = None
+
+    def _build_sequences(self, all_dws, rows_df, exclude_dates=None):
+        """Build (sequence, target, length) triples for each row.
+
+        rows_df must have '_station', 'date' (or 'Sample Date') columns.
+        For training rows: use the DWS time series BEFORE each row's date.
+        """
+        import dws_data as dws_mod
+        DWS_UNIT_CONVERSIONS = dws_mod.DWS_UNIT_CONVERSIONS
+
+        if exclude_dates is None:
+            exclude_dates = {}
+
+        # Parse dates (handle mixed formats: dd-mm-yyyy strings + ISO timestamps)
+        if 'date' not in rows_df.columns or rows_df['date'].dtype == object:
+            if 'Sample Date' in rows_df.columns:
+                dates = pd.to_datetime(
+                    rows_df['Sample Date'], format='mixed', dayfirst=True)
+            else:
+                return [], [], []
+        else:
+            dates = pd.to_datetime(rows_df['date'])
+
+        stations = rows_df['_station'].values
+        conversion = DWS_UNIT_CONVERSIONS.get(self.target_dws_col, 1.0)
+
+        # Feature columns: target + aux + temporal
+        feat_cols = [self.target_dws_col] + _LSTM_AUX_COLS
+
+        sequences, targets, lengths = [], [], []
+
+        for i in range(len(rows_df)):
+            stn = stations[i]
+            dt = dates.iloc[i] if hasattr(dates, 'iloc') else dates[i]
+            if pd.isna(stn) or pd.isna(dt) or stn not in all_dws:
+                sequences.append(None)
+                targets.append(np.nan)
+                lengths.append(0)
+                continue
+
+            sdf = all_dws[stn]
+            stn_excluded = exclude_dates.get(stn, set())
+
+            # Get history before this date
+            mask = sdf['date'] < dt
+            if stn_excluded:
+                mask = mask & ~sdf['date'].dt.date.isin(stn_excluded)
+            hist = sdf[mask].sort_values('date').tail(self.seq_len)
+
+            if len(hist) < 2:
+                sequences.append(None)
+                targets.append(np.nan)
+                lengths.append(0)
+                continue
+
+            # Build feature matrix: [target, aux, month_sin, month_cos]
+            row_feats = []
+            for col in feat_cols:
+                if col in hist.columns:
+                    v = pd.to_numeric(hist[col], errors='coerce').values
+                else:
+                    v = np.full(len(hist), np.nan)
+                row_feats.append(v)
+
+            # Temporal features
+            m = hist['date'].dt.month.values
+            row_feats.append(np.sin(2 * np.pi * m / 12))
+            row_feats.append(np.cos(2 * np.pi * m / 12))
+            doy = hist['date'].dt.dayofyear.values
+            row_feats.append(np.sin(2 * np.pi * doy / 365.25))
+            row_feats.append(np.cos(2 * np.pi * doy / 365.25))
+
+            seq = np.column_stack(row_feats)  # (T, F)
+            sequences.append(seq)
+            lengths.append(len(hist))
+
+            # Target: the actual target value for THIS row
+            idx = rows_df.index[i]
+            if self.target_name in rows_df.columns:
+                targets.append(rows_df.at[idx, self.target_name])
+            else:
+                targets.append(np.nan)
+
+        return sequences, targets, lengths
+
+    def _get_row_dates(self, rows_df):
+        """Extract parsed dates for each row (for temporal splitting)."""
+        if 'date' not in rows_df.columns or rows_df['date'].dtype == object:
+            if 'Sample Date' in rows_df.columns:
+                return pd.to_datetime(
+                    rows_df['Sample Date'], format='mixed',
+                    dayfirst=True).values
+        else:
+            return pd.to_datetime(rows_df['date']).values
+        return None
+
+    def _normalise_sequences(self, sequences, fit=False):
+        """Z-score normalise each feature across all timesteps."""
+        # Collect all valid values to compute mean/std
+        if fit:
+            all_vals = []
+            for seq in sequences:
+                if seq is not None:
+                    all_vals.append(seq)
+            if not all_vals:
+                return sequences
+            big = np.concatenate(all_vals, axis=0)
+            self.feat_means_ = np.nanmean(big, axis=0)
+            self.feat_stds_ = np.nanstd(big, axis=0)
+            self.feat_stds_[self.feat_stds_ < 1e-8] = 1.0
+
+        normed = []
+        for seq in sequences:
+            if seq is None:
+                normed.append(None)
+            else:
+                s = (seq - self.feat_means_) / self.feat_stds_
+                s = np.nan_to_num(s, nan=0.0)
+                normed.append(s)
+        return normed
+
+    def _pad_sequences(self, sequences, lengths):
+        """Pad sequences to fixed length, return tensor + lengths."""
+        n_feat = self.n_features_
+        padded = np.zeros((len(sequences), self.seq_len, n_feat), dtype=np.float32)
+        valid_lengths = np.zeros(len(sequences), dtype=np.int64)
+
+        for i, (seq, l) in enumerate(zip(sequences, lengths)):
+            if seq is not None and l > 0:
+                T = min(l, self.seq_len)
+                padded[i, :T, :] = seq[-T:]
+                valid_lengths[i] = T
+            else:
+                valid_lengths[i] = 1  # at least 1 to avoid pack_padded error
+        return torch.tensor(padded), torch.tensor(valid_lengths)
+
+    def fit(self, all_dws, rows_df, exclude_dates=None):
+        """Train the LSTM on DWS station time series."""
+        print(f"      LSTM: building sequences for {self.target_name}...")
+        sequences, targets, lengths = self._build_sequences(
+            all_dws, rows_df, exclude_dates)
+
+        # Filter to valid rows
+        valid_mask = [(seq is not None and l >= 2 and np.isfinite(t))
+                      for seq, t, l in zip(sequences, targets, lengths)]
+        valid_indices = [i for i, v in enumerate(valid_mask) if v]
+        sequences = [sequences[i] for i in valid_indices]
+        targets = [targets[i] for i in valid_indices]
+        lengths = [lengths[i] for i in valid_indices]
+
+        if len(sequences) < 100:
+            print(f"      LSTM: only {len(sequences)} valid sequences, skipping")
+            return self
+
+        self.n_features_ = sequences[0].shape[1]
+        sequences = self._normalise_sequences(sequences, fit=True)
+
+        y = np.array(targets, dtype=np.float32)
+        if self.use_log:
+            y = np.log1p(np.clip(y, 0, None))
+
+        X_pad, L = self._pad_sequences(sequences, lengths)
+        y_t = torch.tensor(y, dtype=torch.float32)
+
+        # Train/val split — TEMPORAL: last 20% of dates for validation
+        # This prevents future-leaking and gives a more realistic estimate
+        n = len(y)
+        row_dates = self._get_row_dates(rows_df)
+        if row_dates is not None:
+            valid_dates = row_dates[np.array(valid_indices)]
+            date_order = np.argsort(valid_dates)
+            n_train = int(0.8 * n)
+            tr_idx = date_order[:n_train]
+            va_idx = date_order[n_train:]
+        else:
+            # Fallback to random if no date info
+            perm = np.random.RandomState(42).permutation(n)
+            n_train = int(0.8 * n)
+            tr_idx, va_idx = perm[:n_train], perm[n_train:]
+
+        self.model_ = _LSTMNet(self.n_features_, self.hidden,
+                                self.n_layers, dropout=0.2)
+        optimizer = torch.optim.Adam(self.model_.parameters(), lr=self.lr,
+                                      weight_decay=1e-4)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, patience=5, factor=0.5)
+        best_val_loss = float('inf')
+        best_state = None
+        patience_counter = 0
+
+        print(f"      LSTM: training on {n_train} sequences "
+              f"(val={n - n_train}), {self.n_features_} features, "
+              f"seq_len={self.seq_len}...")
+
+        for epoch in range(self.epochs):
+            self.model_.train()
+            # Shuffle training indices
+            np.random.shuffle(tr_idx)
+            epoch_loss = 0.0
+            n_batches = 0
+
+            for start in range(0, len(tr_idx), self.batch_size):
+                batch_idx = tr_idx[start:start + self.batch_size]
+                xb = X_pad[batch_idx]
+                lb = L[batch_idx]
+                yb = y_t[batch_idx]
+
+                pred = self.model_(xb, lb)
+                loss = nn.functional.huber_loss(pred, yb, delta=1.0)
+
+                optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(self.model_.parameters(), 1.0)
+                optimizer.step()
+                epoch_loss += loss.item()
+                n_batches += 1
+
+            # Validation
+            self.model_.eval()
+            with torch.no_grad():
+                va_pred = self.model_(X_pad[va_idx], L[va_idx])
+                va_loss = nn.functional.mse_loss(va_pred, y_t[va_idx]).item()
+            scheduler.step(va_loss)
+
+            if va_loss < best_val_loss:
+                best_val_loss = va_loss
+                best_state = {k: v.clone() for k, v in
+                              self.model_.state_dict().items()}
+                patience_counter = 0
+            else:
+                patience_counter += 1
+
+            if patience_counter >= 10:
+                print(f"      LSTM: early stopping at epoch {epoch+1}")
+                break
+
+        if best_state is not None:
+            self.model_.load_state_dict(best_state)
+
+        # Report validation R²
+        self.model_.eval()
+        with torch.no_grad():
+            va_pred = self.model_(X_pad[va_idx], L[va_idx]).numpy()
+            va_true = y[va_idx]
+            if self.use_log:
+                va_pred_real = np.expm1(va_pred)
+                va_true_real = np.expm1(va_true)
+            else:
+                va_pred_real, va_true_real = va_pred, va_true
+            va_pred_real = np.clip(va_pred_real, 0, None)
+            va_r2 = r2_score(va_true_real, va_pred_real)
+        print(f"      LSTM: val R²={va_r2:.4f} (best_loss={best_val_loss:.4f})")
+        return self
+
+    def predict(self, all_dws, rows_df, exclude_dates=None):
+        """Generate LSTM predictions for each row."""
+        if self.model_ is None or self.n_features_ is None:
+            return np.full(len(rows_df), np.nan)
+
+        sequences, _, lengths = self._build_sequences(
+            all_dws, rows_df, exclude_dates)
+
+        # Handle rows with no valid sequence
+        valid_mask = [(seq is not None and l >= 2)
+                      for seq, l in zip(sequences, lengths)]
+
+        if not any(valid_mask):
+            return np.full(len(rows_df), np.nan)
+
+        # Normalise and pad valid sequences only
+        valid_seqs = [s for s, v in zip(sequences, valid_mask) if v]
+        valid_lens = [l for l, v in zip(lengths, valid_mask) if v]
+        valid_seqs = self._normalise_sequences(valid_seqs, fit=False)
+
+        X_pad, L = self._pad_sequences(valid_seqs, valid_lens)
+
+        self.model_.eval()
+        preds = np.full(len(rows_df), np.nan)
+        with torch.no_grad():
+            # Batch predict
+            all_pred = []
+            for start in range(0, len(valid_seqs), self.batch_size):
+                end = min(start + self.batch_size, len(valid_seqs))
+                p = self.model_(X_pad[start:end], L[start:end]).numpy()
+                all_pred.append(p)
+            all_pred = np.concatenate(all_pred)
+
+            if self.use_log:
+                all_pred = np.expm1(all_pred)
+            all_pred = np.clip(all_pred, 0, None)
+
+        # Map back to original indices
+        vi = 0
+        for i, v in enumerate(valid_mask):
+            if v:
+                preds[i] = all_pred[vi]
+                vi += 1
+
+        return preds
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1.  DWS FEATURE BUILDER (the core of v6)
+# ─────────────────────────────────────────────────────────────────────────────
+def build_dws_training_set(all_dws, targets, exclude_dates=None):
+    """
+    Build the training dataset from DWS station data.  **Vectorised.**
+
+    Uses ALL stations in all_dws (not just test stations).
+    exclude_dates: dict {station_code: set_of_datetime.date} — rows at
+                   these (station, date) pairs are skipped to prevent
+                   target leakage from test data.
+
+    Returns a DataFrame with:
+      - Target columns (unit-converted)
+      - Same-day auxiliary chemistry (dws_aux_*)
+      - Lag features (previous measurement, rolling means)
+      - Temporal features (month, season)
+      - Latitude / Longitude / Sample Date (for enrichment merging)
+    """
+    import dws_data as dws_mod
+
+    DWS_COL_MAP = dws_mod.DWS_COL_MAP
+    DWS_AUX_COLS = dws_mod.DWS_AUX_COLS
+    full_registry = dws_mod._FULL_REGISTRY or dws_mod.STATION_REGISTRY
+
+    if exclude_dates is None:
+        exclude_dates = {}
+
+    station_frames = []
+    n_excluded = 0
+
+    for stn, sdf in all_dws.items():
+        if stn not in full_registry:
+            continue
+        lat, lon = full_registry[stn][0], full_registry[stn][1]
+        stn_excluded = exclude_dates.get(stn, set())
+
+        sf = sdf.sort_values('date').reset_index(drop=True).copy()
+
+        # ── Exclude test dates ───────────────────────────────────────
+        if stn_excluded:
+            keep = ~sf['date'].dt.date.isin(stn_excluded)
+            n_excluded += (~keep).sum()
+            sf = sf[keep].reset_index(drop=True)
+
+        if len(sf) == 0:
+            continue
+
+        # ── Targets ──────────────────────────────────────────────────
+        for dws_col, target in DWS_COL_MAP.items():
+            sf[target] = pd.to_numeric(sf.get(dws_col), errors='coerce')
+        # Keep rows where at least one target is non-NaN
+        tgt_cols = list(DWS_COL_MAP.values())
+        sf = sf[sf[tgt_cols].notna().any(axis=1)].reset_index(drop=True)
+        if len(sf) == 0:
+            continue
+
+        # ── Metadata ─────────────────────────────────────────────────
+        sf['Latitude'] = lat
+        sf['Longitude'] = lon
+        sf['Sample Date'] = sf['date'].dt.strftime('%d-%m-%Y')
+        sf['_station'] = stn
+        sf['_is_dws'] = 1
+        sf['_has_dws_aux'] = 1
+        sf['_has_dws_lag'] = 1
+        sf['_has_stn_hist'] = 1
+        sf['_has_enrichment'] = 0  # set to 1 later by _merge_enrichment_to_dws
+
+        # ── Same-day auxiliary chemistry ─────────────────────────────
+        for aux in DWS_AUX_COLS:
+            sf[f'dws_aux_{aux}'] = pd.to_numeric(sf.get(aux), errors='coerce')
+
+        # ── Temporal ─────────────────────────────────────────────────
+        dt = sf['date']
+        sf['Month'] = dt.dt.month
+        sf['Month_sin'] = np.sin(2 * np.pi * sf['Month'] / 12)
+        sf['Month_cos'] = np.cos(2 * np.pi * sf['Month'] / 12)
+        sf['DayOfYear'] = dt.dt.dayofyear
+        sf['DayOfYear_sin'] = np.sin(2 * np.pi * sf['DayOfYear'] / 365.25)
+        sf['DayOfYear_cos'] = np.cos(2 * np.pi * sf['DayOfYear'] / 365.25)
+        sf['Year'] = dt.dt.year
+
+        # ── Lag features (vectorised via shift / rolling) ────────────
+        for dws_col, target in DWS_COL_MAP.items():
+            pfx = target[:3].upper()
+            vals = pd.to_numeric(sf.get(dws_col), errors='coerce')
+
+            # Forward-fill to get "last non-NaN before me"
+            last_valid = vals.ffill().shift(1)  # shift(1) = previous row
+            sf[f'lag_{pfx}_val'] = last_valid
+
+            # Days since last measurement: date - last_date_with_value
+            valid_date = sf['date'].where(vals.notna()).ffill().shift(1)
+            sf[f'lag_{pfx}_days'] = (sf['date'] - valid_date).dt.days
+
+            # Expanding-window rolling: use only past non-NaN values
+            # rolling(min_periods=1).mean() on an expanding window
+            exp = vals.expanding(min_periods=1)
+            # For roll-N we need the last N non-NaN values.
+            # We use a trick: build a series of only non-NaN values,
+            # compute rolling, then map back.
+            non_nan_vals = vals.dropna()
+            roll3_src  = non_nan_vals.rolling(3,  min_periods=1).mean()
+            roll5_src  = non_nan_vals.rolling(5,  min_periods=1).mean()
+            roll10_src = non_nan_vals.rolling(10, min_periods=1).mean()
+
+            # Map back: for each row, find the rolling mean of the
+            # last K non-NaN values BEFORE this row.
+            # "Before" = shift the non-NaN series by 1, then reindex.
+            roll3_shifted  = roll3_src.shift(1).reindex(sf.index)
+            roll5_shifted  = roll5_src.shift(1).reindex(sf.index)
+            roll10_shifted = roll10_src.shift(1).reindex(sf.index)
+
+            # Forward-fill to fill NaN rows between valid measurements
+            sf[f'roll3_{pfx}']  = roll3_shifted.ffill()
+            sf[f'roll5_{pfx}']  = roll5_shifted.ffill()
+            sf[f'roll10_{pfx}'] = roll10_shifted.ffill()
+
+            # First row has no history → NaN (shift already handles this)
+
+        # ── Lag for key auxiliary chemistry (vectorised) ─────────────
+        for aux in ['pH_Diss_Water', 'Ca_Diss_Water', 'Mg_Diss_Water',
+                    'Na_Diss_Water', 'Cl_Diss_Water', 'SO4_Diss_Water']:
+            if aux in sf.columns:
+                aux_vals = pd.to_numeric(sf[aux], errors='coerce')
+                sf[f'lag_aux_{aux}'] = aux_vals.ffill().shift(1)
+            else:
+                sf[f'lag_aux_{aux}'] = np.nan
+
+        station_frames.append(sf)
+
+    # ── Assemble ─────────────────────────────────────────────────────
+    # Select only the columns we need (drop raw DWS columns)
+    keep_prefixes = ('Latitude', 'Longitude', 'Sample Date', '_station',
+                     '_is_dws', '_has_dws', '_has_stn', '_has_enrichment',
+                     'Total', 'Electrical', 'Dissolved',
+                     'dws_aux_', 'Month', 'DayOfYear', 'Year',
+                     'lag_', 'roll3_', 'roll5_', 'roll10_',
+                     'Month_sin', 'Month_cos', 'DayOfYear_sin',
+                     'DayOfYear_cos')
+
+    all_cols = set()
+    for sf in station_frames:
+        for c in sf.columns:
+            if any(c.startswith(p) or c == p for p in keep_prefixes):
+                all_cols.add(c)
+    all_cols = sorted(all_cols)
+
+    dws_df = pd.concat(
+        [sf[[c for c in all_cols if c in sf.columns]] for sf in station_frames],
+        ignore_index=True,
+    )
+    print(f"   Built DWS training set: {len(dws_df)} rows from "
+          f"{dws_df['_station'].nunique()} stations"
+          f" ({n_excluded} test-date rows excluded)")
+
+    return dws_df
+
+
+def add_station_historical_features(df, all_dws):
+    """
+    Add station-level historical statistics as features.
+
+    v7 change: ONLY auxiliary chemistry stats (pH, Ca, Mg, Na, Cl, SO4, F).
+    Target-level stats (stn_TAL_mean, stn_EC_mean, stn_DRP_mean, …) are
+    REMOVED because they cause station memorisation → catastrophic OOD
+    failure (R²=-72 on unseen stations).
+
+    Chemistry stats generalise because they describe the geochemical
+    regime, not the target value itself.
+    """
+    import dws_data as dws_mod
+    full_registry = dws_mod._FULL_REGISTRY or dws_mod.STATION_REGISTRY
+
+    stn_stats = {}
+    for stn, sdf in all_dws.items():
+        if stn not in full_registry:
+            continue
+        feats = {}
+
+        # Auxiliary chemistry stats ONLY (no target stats!)
+        for aux in ['pH_Diss_Water', 'Ca_Diss_Water', 'Mg_Diss_Water',
+                    'Na_Diss_Water', 'Cl_Diss_Water', 'SO4_Diss_Water',
+                    'F_Diss_Water', 'Si_Diss_Water', 'K_Diss_Water',
+                    'NH4_N_Diss_Water', 'NO3_NO2_N_Diss_Water',
+                    'DMS_Tot_Water']:
+            vals = pd.to_numeric(
+                sdf.get(aux, pd.Series(dtype=float)), errors='coerce'
+            ).dropna()
+            short = aux.split('_')[0]
+            if len(vals) >= 3:
+                feats[f'stn_aux_{short}_mean'] = vals.mean()
+                feats[f'stn_aux_{short}_std'] = vals.std()
+                feats[f'stn_aux_{short}_median'] = vals.median()
+                feats[f'stn_aux_{short}_cv'] = vals.std() / (vals.mean() + 1e-8)
+                # Seasonal amplitude
+                dates = sdf.loc[vals.index, 'date']
+                ms = pd.Series(vals.values, index=pd.DatetimeIndex(dates.values))
+                monthly = ms.groupby(ms.index.month).mean()
+                feats[f'stn_aux_{short}_season'] = monthly.max() - monthly.min()
+            else:
+                feats[f'stn_aux_{short}_mean'] = vals.mean() if len(vals) else np.nan
+                feats[f'stn_aux_{short}_std'] = np.nan
+
+        # Station metadata: number of historical observations (useful proxy
+        # for data quality, not station identity)
+        feats['stn_n_obs'] = len(sdf)
+        feats['stn_date_span_years'] = (
+            (sdf['date'].max() - sdf['date'].min()).days / 365.25
+            if len(sdf) > 1 else 0.0
+        )
+
+        stn_stats[stn] = feats
+
+    stats_df = pd.DataFrame(stn_stats).T
+    stats_df.index.name = '_station'
+    stats_df = stats_df.reset_index()
+
+    df = df.merge(stats_df, on='_station', how='left')
+    print(f"   Station historical features: {len(stats_df.columns)-1} features "
+          f"for {len(stats_df)} stations")
+    return df
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1b.  TIME-WEIGHTED STATION FEATURES (exponential decay)
+# ─────────────────────────────────────────────────────────────────────────────
+def add_time_weighted_station_features(df, all_dws, halflife_days=730):
+    """
+    Add exponentially-weighted recent station averages alongside all-time
+    averages.  Recent chemistry (last ~2 years) is more predictive of
+    current water quality than decade-old measurements.
+
+    halflife_days: exponential decay half-life (default 730 = 2 years).
+    Halving time: a measurement 2 years old gets weight 0.5, 4 years → 0.25.
+    """
+    import dws_data as dws_mod
+    full_registry = dws_mod._FULL_REGISTRY or dws_mod.STATION_REGISTRY
+    decay = np.log(2) / halflife_days
+
+    chem_cols = ['pH_Diss_Water', 'Ca_Diss_Water', 'Mg_Diss_Water',
+                 'Na_Diss_Water', 'Cl_Diss_Water', 'SO4_Diss_Water',
+                 'F_Diss_Water', 'Si_Diss_Water', 'K_Diss_Water',
+                 'NH4_N_Diss_Water', 'NO3_NO2_N_Diss_Water',
+                 'DMS_Tot_Water']
+
+    stn_tw = {}
+    for stn, sdf in all_dws.items():
+        if stn not in full_registry:
+            continue
+        feats = {}
+        if 'date' not in sdf.columns or len(sdf) < 3:
+            stn_tw[stn] = feats
+            continue
+
+        ref_date = sdf['date'].max()  # most recent measurement
+        days_ago = (ref_date - sdf['date']).dt.days.values
+        weights = np.exp(-decay * days_ago)
+
+        for aux in chem_cols:
+            vals = pd.to_numeric(
+                sdf.get(aux, pd.Series(dtype=float)), errors='coerce')
+            valid = vals.notna().values
+            if valid.sum() < 3:
+                continue
+            short = aux.split('_')[0]
+            v = vals.values[valid]
+            w = weights[valid]
+            w_sum = w.sum()
+            if w_sum < 1e-10:
+                continue
+
+            # Exponentially-weighted mean
+            ew_mean = np.average(v, weights=w)
+            # Exponentially-weighted std
+            ew_var = np.average((v - ew_mean) ** 2, weights=w)
+            ew_std = np.sqrt(ew_var)
+
+            feats[f'stn_tw_{short}_mean'] = ew_mean
+            feats[f'stn_tw_{short}_std'] = ew_std
+            # Trend: difference between recent EW mean and all-time mean
+            all_mean = v.mean()
+            feats[f'stn_tw_{short}_trend'] = ew_mean - all_mean
+
+        stn_tw[stn] = feats
+
+    tw_df = pd.DataFrame(stn_tw).T
+    tw_df.index.name = '_station'
+    tw_df = tw_df.reset_index()
+
+    n_before = len(df.columns)
+    df = df.merge(tw_df, on='_station', how='left')
+    n_new = len(df.columns) - n_before
+    print(f"   Time-weighted station features: {n_new} features "
+          f"for {len(tw_df)} stations (halflife={halflife_days}d)")
+    return df
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1c.  ADVERSARIAL VALIDATION  (detect train/test distribution shift)
+# ─────────────────────────────────────────────────────────────────────────────
+def adversarial_validation(train_df, test_df, features, top_k=5):
+    """
+    Train a classifier to distinguish train vs test rows.
+    Features highly predictive of "is_test" reveal distribution shift.
+
+    Returns:
+      - adv_importances: dict {feature: importance}  (sorted desc)
+      - adv_auc: AUC of the adversarial classifier
+      - shift_features: top_k features most predictive of test
+    """
+    from sklearn.model_selection import cross_val_predict
+    from sklearn.metrics import roc_auc_score
+
+    feats = [f for f in features if f in train_df.columns and f in test_df.columns]
+    if len(feats) < 5:
+        print("   Adversarial validation: not enough shared features")
+        return {}, 0.5, []
+
+    X_train = train_df[feats].values.astype(np.float64)
+    X_test  = test_df[feats].values.astype(np.float64)
+    X = np.vstack([X_train, X_test])
+    y = np.concatenate([np.zeros(len(X_train)), np.ones(len(X_test))])
+
+    # Fix inf/nan
+    X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+
+    clf = lgb.LGBMClassifier(
+        n_estimators=200, learning_rate=0.05, max_depth=3,
+        subsample=0.7, colsample_bytree=0.5, n_jobs=-1,
+        random_state=42, verbose=-1,
+    ) if HAS_LGB else xgb.XGBClassifier(
+        n_estimators=200, learning_rate=0.05, max_depth=3,
+        n_jobs=-1, random_state=42,
+    )
+
+    # 3-fold CV to get OOF probabilities
+    from sklearn.model_selection import StratifiedKFold
+    skf = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+    oof_probs = cross_val_predict(clf, X, y, cv=skf, method='predict_proba')[:, 1]
+    auc = roc_auc_score(y, oof_probs)
+
+    # Retrain on full data for importances
+    clf.fit(X, y)
+    importances = clf.feature_importances_ if hasattr(clf, 'feature_importances_') else np.zeros(len(feats))
+    imp_dict = dict(sorted(zip(feats, importances),
+                           key=lambda x: x[1], reverse=True))
+    shift_features = list(imp_dict.keys())[:top_k]
+
+    print(f"   Adversarial validation: AUC={auc:.3f}")
+    if auc > 0.7:
+        print(f"   ⚠ Significant distribution shift detected!")
+        print(f"   Top shift features: {shift_features}")
+    else:
+        print(f"   Low shift (AUC={auc:.3f}) — train/test distributions similar")
+
+    return imp_dict, auc, shift_features
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1d.  STATION-AWARE SAMPLE WEIGHTING
+# ─────────────────────────────────────────────────────────────────────────────
+def compute_station_weights(df, test_stations, base_weight=1.0,
+                            test_station_weight=4.0):
+    """
+    Compute per-row sample weights.  Rows from test-location stations
+    get higher weight because they're directly relevant.
+
+    test_stations: set of station codes that appear in test data
+    base_weight:   weight for non-test-station rows
+    test_station_weight: weight for rows from test stations
+    """
+    stations = df.get('_station')
+    if stations is None:
+        return np.ones(len(df))
+    weights = np.full(len(df), base_weight)
+    test_mask = stations.isin(test_stations).values
+    weights[test_mask] = test_station_weight
+    n_test = test_mask.sum()
+    print(f"   Sample weights: {n_test}/{len(df)} rows from test stations "
+          f"(weight={test_station_weight}x)")
+    return weights
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2.  TARGET-SPECIFIC TRANSFORMS + MODEL CONFIGS
+# ─────────────────────────────────────────────────────────────────────────────
+class TargetTransformer:
+    """Per-target optimal transform instead of blanket log1p.
+
+    EC  (roughly log-normal)         → log1p           (standard)
+    TAL (moderate skew)              → Yeo-Johnson     (handles negatives, moderate skew)
+    DRP (heavy right skew, near-zero)→ log1p(x + ε)    (shift avoids log(0) issues)
+    """
+    def __init__(self, method='log1p'):
+        self.method = method   # 'log1p' | 'yeojohnson' | 'shifted_log'
+        self._yj = None
+        self._shift = 1.0  # additive shift for shifted_log
+
+    def fit_transform(self, y):
+        y = np.array(y, dtype=np.float64)
+        y = np.clip(y, 0, None)  # safety
+        if self.method == 'log1p':
+            return np.log1p(y)
+        elif self.method == 'yeojohnson':
+            self._yj = PowerTransformer(method='yeo-johnson', standardize=False)
+            return self._yj.fit_transform(y.reshape(-1, 1)).ravel()
+        elif self.method == 'shifted_log':
+            # Shift: log1p(y + 1) — extra shift for near-zero DRP
+            return np.log1p(y + self._shift)
+        return y
+
+    def transform(self, y):
+        y = np.array(y, dtype=np.float64)
+        y = np.clip(y, 0, None)
+        if self.method == 'log1p':
+            return np.log1p(y)
+        elif self.method == 'yeojohnson':
+            if self._yj is not None:
+                return self._yj.transform(y.reshape(-1, 1)).ravel()
+            return np.log1p(y)  # fallback
+        elif self.method == 'shifted_log':
+            return np.log1p(y + self._shift)
+        return y
+
+    def inverse_transform(self, y_t):
+        y_t = np.array(y_t, dtype=np.float64)
+        if self.method == 'log1p':
+            return np.expm1(y_t)
+        elif self.method == 'yeojohnson':
+            if self._yj is not None:
+                return self._yj.inverse_transform(y_t.reshape(-1, 1)).ravel()
+            return np.expm1(y_t)  # fallback
+        elif self.method == 'shifted_log':
+            return np.expm1(y_t) - self._shift
+        return y_t
+
+
+def _get_target_transform(target_name):
+    """Return the optimal TargetTransformer for each target."""
+    if 'Phosphorus' in target_name:
+        return TargetTransformer('shifted_log')   # heavy right skew, many near-zero
+    elif 'Conductance' in target_name:
+        return TargetTransformer('log1p')         # roughly log-normal
+    else:  # Alkalinity
+        return TargetTransformer('yeojohnson')    # moderate skew
+
+
 def _get_models_for_target(target_name):
-    use_log = True  # All targets are right-skewed
+    """
+    Returns (list_of_(name, estimator), TargetTransformer).
+
+    v7: target-specific transforms instead of blanket log1p.
+    """
+    target_tf = _get_target_transform(target_name)
 
     if 'Phosphorus' in target_name:
+        # DRP is very noisy — Huber loss is more robust to outliers
         xgb_p = dict(
-            n_estimators=3000, learning_rate=0.01, max_depth=3,
-            min_child_weight=40, subsample=0.6, colsample_bytree=0.3,
-            colsample_bylevel=0.5, reg_alpha=5.0, reg_lambda=15.0,
-            gamma=2.0, n_jobs=-1, tree_method='hist', random_state=42,
+            objective='reg:pseudohubererror',
+            n_estimators=1000, learning_rate=0.025, max_depth=3,
+            min_child_weight=80, subsample=0.65, colsample_bytree=0.3,
+            colsample_bylevel=0.5, reg_alpha=10.0, reg_lambda=30.0,
+            gamma=3.0, max_delta_step=5.0,
+            n_jobs=-1, tree_method='hist', random_state=42,
         )
         lgb_p = dict(
-            n_estimators=3000, learning_rate=0.01, num_leaves=8,
-            max_depth=3, min_child_samples=60, subsample=0.6,
-            colsample_bytree=0.3, reg_alpha=5.0, reg_lambda=15.0,
+            objective='huber', alpha=1.0,  # Huber delta
+            n_estimators=1000, learning_rate=0.025, num_leaves=12,
+            max_depth=4, min_child_samples=80, subsample=0.65,
+            colsample_bytree=0.3, reg_alpha=10.0, reg_lambda=30.0,
             n_jobs=-1, random_state=42, verbose=-1,
         )
     elif 'Conductance' in target_name:
+        # EC has strong aux correlations — moderate regularisation
         xgb_p = dict(
-            n_estimators=3000, learning_rate=0.01, max_depth=4,
-            min_child_weight=30, subsample=0.65, colsample_bytree=0.35,
-            colsample_bylevel=0.5, reg_alpha=3.0, reg_lambda=10.0,
-            gamma=1.5, n_jobs=-1, tree_method='hist', random_state=42,
+            n_estimators=1200, learning_rate=0.025, max_depth=4,
+            min_child_weight=60, subsample=0.65, colsample_bytree=0.35,
+            colsample_bylevel=0.5, reg_alpha=8.0, reg_lambda=25.0,
+            gamma=2.0, max_delta_step=3.0,
+            n_jobs=-1, tree_method='hist', random_state=42,
         )
         lgb_p = dict(
-            n_estimators=3000, learning_rate=0.01, num_leaves=12,
-            max_depth=4, min_child_samples=40, subsample=0.65,
-            colsample_bytree=0.35, reg_alpha=3.0, reg_lambda=10.0,
+            n_estimators=1200, learning_rate=0.025, num_leaves=15,
+            max_depth=4, min_child_samples=60, subsample=0.65,
+            colsample_bytree=0.35, reg_alpha=8.0, reg_lambda=25.0,
             n_jobs=-1, random_state=42, verbose=-1,
         )
     else:  # Alkalinity
         xgb_p = dict(
-            n_estimators=3000, learning_rate=0.01, max_depth=4,
-            min_child_weight=25, subsample=0.65, colsample_bytree=0.35,
-            colsample_bylevel=0.5, reg_alpha=2.0, reg_lambda=8.0,
-            gamma=1.0, n_jobs=-1, tree_method='hist', random_state=42,
+            n_estimators=1200, learning_rate=0.025, max_depth=4,
+            min_child_weight=60, subsample=0.65, colsample_bytree=0.35,
+            colsample_bylevel=0.5, reg_alpha=8.0, reg_lambda=25.0,
+            gamma=2.0, max_delta_step=3.0,
+            n_jobs=-1, tree_method='hist', random_state=42,
         )
         lgb_p = dict(
-            n_estimators=3000, learning_rate=0.01, num_leaves=12,
-            max_depth=4, min_child_samples=35, subsample=0.65,
-            colsample_bytree=0.35, reg_alpha=2.0, reg_lambda=8.0,
+            n_estimators=1200, learning_rate=0.025, num_leaves=15,
+            max_depth=4, min_child_samples=60, subsample=0.65,
+            colsample_bytree=0.35, reg_alpha=8.0, reg_lambda=25.0,
             n_jobs=-1, random_state=42, verbose=-1,
         )
 
@@ -309,109 +1108,401 @@ def _get_models_for_target(target_name):
 
     if HAS_CB:
         cb_p = dict(
-            iterations=2000, learning_rate=0.01, depth=4,
-            l2_leaf_reg=15.0, random_seed=42, verbose=0,
+            iterations=1000, learning_rate=0.025, depth=4,
+            l2_leaf_reg=30.0, random_seed=42, verbose=0,
             subsample=0.65, colsample_bylevel=0.35,
-            min_data_in_leaf=40,
+            min_data_in_leaf=60,
         )
+        # Huber loss for DRP — robust to outliers
+        if 'Phosphorus' in target_name:
+            cb_p['loss_function'] = 'Huber:delta=1.0'
         estimators.append(('cb', CatBoostRegressor(**cb_p)))
 
-    # Extra-Trees
+    # Extra-Trees — deeper config for better expressiveness & ensemble diversity
     et_pipe = Pipeline([
         ('imputer', SimpleImputer(strategy='median')),
         ('et', ExtraTreesRegressor(
-            n_estimators=500, max_depth=8, min_samples_leaf=20,
-            max_features=0.3, n_jobs=-1, random_state=42,
+            n_estimators=1000, max_depth=15, min_samples_leaf=20,
+            max_features=0.5, n_jobs=-1, random_state=42,
         )),
     ])
     estimators.append(('et', et_pipe))
 
-    # Ridge regression — completely different inductive bias
-    ridge_pipe = Pipeline([
-        ('imputer', SimpleImputer(strategy='median')),
-        ('scaler', StandardScaler()),
-        ('ridge', Ridge(alpha=10.0)),
-    ])
-    estimators.append(('ridge', ridge_pipe))
+    # Ridge — REMOVED: produces R²=-inf in multiple CV folds,
+    # destabilises the L2 meta-learner despite near-zero weight.
+    # ridge_pipe = Pipeline([
+    #     ('imputer', SimpleImputer(strategy='median')),
+    #     ('scaler', StandardScaler()),
+    #     ('ridge', Ridge(alpha=50.0)),
+    # ])
+    # estimators.append(('ridge', ridge_pipe))
 
-    return estimators, use_log
+    # HistGradientBoosting — sklearn native, handles NaN, fast, adds diversity
+    hgb = HistGradientBoostingRegressor(
+        max_iter=1000, learning_rate=0.025, max_depth=4,
+        min_samples_leaf=60, max_leaf_nodes=15,
+        l2_regularization=25.0,
+        random_state=42,
+    )
+    estimators.append(('hgb', hgb))
+
+    return estimators, target_tf
 
 
-# 2.  WEIGHTED ENSEMBLE  
-class WeightedEnsemble(BaseEstimator, RegressorMixin):
+# ─────────────────────────────────────────────────────────────────────────────
+# 2b.  PER-STATION CALIBRATION
+# ─────────────────────────────────────────────────────────────────────────────
+class StationCalibrator:
+    """
+    Post-prediction calibration using each station's historical distribution.
 
-    def __init__(self, estimators):
+    For every test row at station S, the raw model prediction is z-scored
+    against the global training distribution, then mapped onto station S's
+    historical distribution.  This corrects systematic per-station bias
+    (e.g., always-high-EC stations) without any model change.
+
+    blend_weight: fraction of calibrated prediction to use (0=raw, 1=full).
+    A moderate value (0.4-0.6) hedges against sparse station histories.
+    """
+
+    def __init__(self, blend_weight=0.5):
+        self.blend_weight = blend_weight
+        self.global_mean_ = None
+        self.global_std_ = None
+        self.station_stats_ = {}  # {station: (mean, std, median, q25, q75)}
+
+    def fit(self, all_dws, target, dws_col, exclude_dates=None):
+        """Compute per-station and global statistics for target.
+
+        NOTE: all_dws data is already unit-converted by
+        dws_data.load_all_station_data(), so we do NOT apply
+        DWS_UNIT_CONVERSIONS here.
+        """
+        if exclude_dates is None:
+            exclude_dates = {}
+
+        all_vals = []
+        for stn, sdf in all_dws.items():
+            vals = pd.to_numeric(sdf.get(dws_col, pd.Series(dtype=float)),
+                                errors='coerce')
+            # NO unit conversion — already done in load_all_station_data
+            # Exclude test dates
+            if stn in exclude_dates:
+                keep = ~sdf['date'].dt.date.isin(exclude_dates[stn])
+                vals = vals[keep]
+            vals = vals.dropna()
+            if len(vals) >= 5:
+                self.station_stats_[stn] = {
+                    'mean': float(vals.mean()),
+                    'std': float(vals.std()),
+                    'median': float(vals.median()),
+                    'q25': float(vals.quantile(0.25)),
+                    'q75': float(vals.quantile(0.75)),
+                    'min': float(vals.min()),
+                    'max': float(vals.max()),
+                    'n': len(vals),
+                }
+                all_vals.extend(vals.values)
+
+        all_vals = np.array(all_vals)
+        self.global_mean_ = float(np.mean(all_vals)) if len(all_vals) else 0.0
+        self.global_std_ = float(np.std(all_vals)) if len(all_vals) else 1.0
+        if self.global_std_ < 1e-8:
+            self.global_std_ = 1.0
+
+        print(f"      Calibrator: {len(self.station_stats_)} stations, "
+              f"global mean={self.global_mean_:.2f}, std={self.global_std_:.2f}")
+        return self
+
+    def calibrate(self, preds, stations):
+        """Apply per-station calibration to predictions.
+
+        preds: array of shape (N,) — raw model predictions
+        stations: array of shape (N,) — station codes (can have NaN)
+
+        Returns calibrated predictions.
+        """
+        calibrated = preds.copy()
+        w = self.blend_weight
+
+        for i in range(len(preds)):
+            stn = stations[i] if not pd.isna(stations[i]) else None
+            if stn is None or stn not in self.station_stats_:
+                continue
+
+            stats = self.station_stats_[stn]
+            stn_mean = stats['mean']
+            stn_std = stats['std']
+            if stn_std < 1e-8:
+                stn_std = self.global_std_
+
+            # Z-score the prediction against global distribution
+            z = (preds[i] - self.global_mean_) / self.global_std_
+
+            # Map to station distribution
+            cal_pred = stn_mean + z * stn_std
+
+            # Clip to station historical range (with margin)
+            cal_pred = np.clip(cal_pred,
+                               stats['min'] * 0.5,
+                               stats['max'] * 1.5)
+
+            # Blend: weighted average of raw and calibrated
+            calibrated[i] = (1 - w) * preds[i] + w * cal_pred
+
+        calibrated = np.clip(calibrated, 0, None)
+        return calibrated
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3.  STACKING ENSEMBLE  (SOTA: 2-layer stacking, per AutoGluon architecture)
+# ─────────────────────────────────────────────────────────────────────────────
+class StackingEnsemble(BaseEstimator, RegressorMixin):
+    """
+    2-layer stacking ensemble — the SOTA architecture for tabular ML.
+
+    L1:  Base models (XGB, LGB, CB, HGB, ET, Ridge) trained with K-fold CV.
+         Out-of-fold (OOF) predictions are collected.
+    L2:  RidgeCV meta-learner learns optimal combination weights from OOF.
+    Predict:  Bagged L1 predictions (averaged across K fold-models) → L2.
+
+    AutoGluon (Erickson et al., 2020) showed multi-layer stacking
+    consistently outperforms single-model or simple-average ensembles,
+    beating 99% of Kaggle participants with just 4h of training.
+    """
+
+    def __init__(self, estimators, n_folds=5):
         self.estimators = estimators
+        self.n_folds = n_folds
 
-    def fit(self, X, y, groups=None):
-        X_arr = np.nan_to_num(np.array(X, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+    # Models that handle NaN natively (tree-based)
+    _NATIVE_NAN_MODELS = {'xgb', 'lgb', 'cb', 'hgb'}
+
+    @staticmethod
+    def _prepare_X(X, model_name=None):
+        """Prepare feature matrix: keep NaN for tree models, fill for others."""
+        X_arr = np.array(X, dtype=np.float64)
+        X_arr = np.where(np.isposinf(X_arr), 0.0, X_arr)
+        X_arr = np.where(np.isneginf(X_arr), 0.0, X_arr)
+        if model_name and model_name not in StackingEnsemble._NATIVE_NAN_MODELS:
+            X_arr = np.nan_to_num(X_arr, nan=0.0)
+        return X_arr
+
+    @staticmethod
+    def _fit_with_weight(model, X, y, sample_weight=None):
+        """Fit a model, passing sample_weight correctly for Pipelines."""
+        if sample_weight is None:
+            model.fit(X, y)
+            return
+        try:
+            model.fit(X, y, sample_weight=sample_weight)
+        except (TypeError, ValueError):
+            if hasattr(model, 'named_steps'):
+                last_step = list(model.named_steps.keys())[-1]
+                try:
+                    model.fit(X, y,
+                              **{f'{last_step}__sample_weight': sample_weight})
+                except (TypeError, ValueError):
+                    model.fit(X, y)
+            else:
+                model.fit(X, y)
+
+    def fit(self, X, y, groups=None, sample_weight=None):
+        X_raw = np.array(X, dtype=np.float64)
         y_arr = np.array(y, dtype=np.float64)
+        w_arr = (np.array(sample_weight, dtype=np.float64)
+                 if sample_weight is not None else None)
+        n = len(y_arr)
 
-        n_splits = 5
+        # ── Set up CV splits ───────────────────────────────────────────
+        n_splits = self.n_folds
         if groups is not None:
             n_unique = len(set(groups))
             n_splits = min(n_splits, n_unique)
             gkf = GroupKFold(n_splits=n_splits)
-            split_fn = lambda: gkf.split(X_arr, y_arr, groups=groups)
+            splits = list(gkf.split(X_raw, y_arr, groups=groups))
         else:
             from sklearn.model_selection import KFold
             kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
-            split_fn = lambda: kf.split(X_arr, y_arr)
+            splits = list(kf.split(X_raw, y_arr))
 
-        # Evaluate each model via OOF to get weights
-        model_scores = []
-        for name, est in self.estimators:
-            fold_r2s = []
-            for tr, va in split_fn():
+        n_models = len(self.estimators)
+        oof_preds = np.full((n, n_models), np.nan)
+        fold_models = {name: [] for name, _ in self.estimators}
+
+        # ── Step 1: Generate OOF predictions via K-fold CV ─────────────
+        for fi, (tr_idx, va_idx) in enumerate(splits):
+            for mi, (name, est) in enumerate(self.estimators):
                 try:
                     m = clone(est)
-                    m.fit(X_arr[tr], y_arr[tr])
-                    preds = m.predict(X_arr[va])
-                    preds = np.nan_to_num(preds, nan=0.0, posinf=0.0, neginf=0.0)
-                    fold_r2s.append(max(r2_score(y_arr[va], preds), 0.0))
+                    X_tr = self._prepare_X(X_raw[tr_idx], name)
+                    X_va = self._prepare_X(X_raw[va_idx], name)
+                    self._fit_with_weight(
+                        m, X_tr, y_arr[tr_idx],
+                        w_arr[tr_idx] if w_arr is not None else None)
+                    preds = m.predict(X_va)
+                    preds = np.nan_to_num(preds, nan=0.0, posinf=0.0,
+                                          neginf=0.0)
+                    oof_preds[va_idx, mi] = preds
+                    fold_models[name].append(m)
                 except Exception as e:
-                    warnings.warn(f"   {name} failed in fold: {e}")
-                    fold_r2s.append(0.0)
-            mean_r2 = np.mean(fold_r2s)
-            model_scores.append(mean_r2)
-            print(f"      {name:>8s}: OOF R²={mean_r2:.4f} "
-                  f"(±{np.std(fold_r2s):.3f})")
+                    warnings.warn(f"   {name} failed in fold {fi}: {e}")
+                    oof_preds[va_idx, mi] = np.nanmean(y_arr)
 
-        # Compute weights (proportional to R2, floor at 0)
-        scores = np.array(model_scores)
-        scores = np.maximum(scores, 0.0)
-        if scores.sum() > 0:
-            self.weights_ = scores / scores.sum()
+        # ── Report per-L1-model OOF R² ─────────────────────────────────
+        for mi, (name, _) in enumerate(self.estimators):
+            valid = np.isfinite(oof_preds[:, mi])
+            if valid.sum() > 10:
+                r2 = max(r2_score(y_arr[valid], oof_preds[valid, mi]), 0.0)
+            else:
+                r2 = 0.0
+            print(f"      {name:>8s}: OOF R²={r2:.4f}")
+
+        # ── Step 2: Train L2 meta-learner on OOF predictions ───────────
+        valid = np.all(np.isfinite(oof_preds), axis=1)
+        if valid.sum() >= 20:
+            self.meta_learner_ = Pipeline([
+                ('scaler', StandardScaler()),
+                ('ridge', RidgeCV(
+                    alphas=[0.01, 0.1, 1.0, 10.0, 100.0],
+                    fit_intercept=True)),
+            ])
+            self.meta_learner_.fit(oof_preds[valid], y_arr[valid])
+            meta_preds = self.meta_learner_.predict(oof_preds[valid])
+            meta_r2 = r2_score(y_arr[valid], meta_preds)
+            print(f"      {'L2 stack':>8s}: OOF R²={meta_r2:.4f}")
+
+            # Report effective weights
+            ridge_m = self.meta_learner_.named_steps['ridge']
+            scaler_m = self.meta_learner_.named_steps['scaler']
+            coefs = ridge_m.coef_ / (scaler_m.scale_ + 1e-10)
+            # Normalise for display (actual combination uses Ridge directly)
+            abs_sum = np.abs(coefs).sum() + 1e-10
+            rel_w = coefs / abs_sum
+            print(f"      Effective weights: "
+                  f"{dict(zip([n for n,_ in self.estimators], [f'{w:.3f}' for w in rel_w]))}")
         else:
-            self.weights_ = np.ones(len(scores)) / len(scores)
+            print("      Warning: insufficient OOF data, using equal weights")
+            self.meta_learner_ = None
 
-        print(f"      Weights: {dict(zip([n for n,_ in self.estimators], [f'{w:.3f}' for w in self.weights_]))}")
-
-        # Fit all models on full data
+        # ── Step 3: Retrain all L1 models on full data ─────────────────
         self.fitted_models_ = []
-        self.model_names_   = []
+        self.model_names_ = []
         for name, est in self.estimators:
             m = clone(est)
-            m.fit(X_arr, y_arr)
+            X_fit = self._prepare_X(X_raw, name)
+            self._fit_with_weight(
+                m, X_fit, y_arr,
+                w_arr if w_arr is not None else None)
             self.fitted_models_.append(m)
             self.model_names_.append(name)
+
+        # Store fold models for bagged prediction (more robust)
+        self.fold_models_ = fold_models
+        return self
+
+    def predict(self, X):
+        X_raw = np.array(X, dtype=np.float64)
+        n = len(X_raw)
+        n_models = len(self.fitted_models_)
+
+        # ── L1 predictions: bagged (averaged across fold models) ───────
+        l1_preds = np.zeros((n, n_models))
+        for mi, name in enumerate(self.model_names_):
+            fold_ms = self.fold_models_.get(name, [])
+            if len(fold_ms) >= 2:
+                # Average predictions from all fold models (bagging)
+                X_m = self._prepare_X(X_raw, name)
+                bag = []
+                for m in fold_ms:
+                    p = np.nan_to_num(m.predict(X_m),
+                                      nan=0.0, posinf=0.0, neginf=0.0)
+                    bag.append(p)
+                l1_preds[:, mi] = np.mean(bag, axis=0)
+            else:
+                # Fallback to full-data model
+                X_m = self._prepare_X(X_raw, name)
+                l1_preds[:, mi] = np.nan_to_num(
+                    self.fitted_models_[mi].predict(X_m),
+                    nan=0.0, posinf=0.0, neginf=0.0)
+
+        # ── L2 meta-learner combination ────────────────────────────────
+        if self.meta_learner_ is not None:
+            return self.meta_learner_.predict(l1_preds)
+        else:
+            # Fallback: equal-weight average
+            return l1_preds.mean(axis=1)
+
+
+class MultiSeedEnsemble(BaseEstimator, RegressorMixin):
+    """
+    Train N StackingEnsembles with different random seeds and average.
+
+    This reduces variance by ~1/sqrt(N) — standard in every top Kaggle
+    solution.  Each seed perturbs:
+      - The K-fold split (different random KFold)
+      - The random_state of all L1 tree models
+      - The SubSample / colsample randomness within trees
+
+    The result is a more robust prediction that smooths out
+    individual-seed noise.
+    """
+
+    def __init__(self, base_estimators, n_seeds=3, n_folds=5):
+        self.base_estimators = base_estimators
+        self.n_seeds = n_seeds
+        self.n_folds = n_folds
+        self.seed_ensembles_ = []
+
+    @staticmethod
+    def _reseeded_estimators(estimators, seed):
+        """Clone estimators with a different random_state."""
+        reseeded = []
+        for name, est in estimators:
+            m = clone(est)
+            # Set random_state if the estimator supports it
+            if hasattr(m, 'random_state'):
+                m.set_params(random_state=seed)
+            elif hasattr(m, 'random_seed'):
+                m.set_params(random_seed=seed)
+            # For pipelines, set the inner estimator's random_state
+            if hasattr(m, 'named_steps'):
+                for step_name, step in m.named_steps.items():
+                    if hasattr(step, 'random_state'):
+                        step.set_params(random_state=seed)
+            reseeded.append((name, m))
+        return reseeded
+
+    def fit(self, X, y, groups=None, sample_weight=None):
+        self.seed_ensembles_ = []
+        seeds = [42 + i * 1000 for i in range(self.n_seeds)]
+
+        for si, seed in enumerate(seeds):
+            print(f"\n   ── Multi-seed round {si+1}/{self.n_seeds} "
+                  f"(seed={seed}) ──")
+            reseeded = self._reseeded_estimators(
+                self.base_estimators, seed)
+            ens = StackingEnsemble(reseeded, n_folds=self.n_folds)
+            ens.fit(X, y, groups=groups, sample_weight=sample_weight)
+            self.seed_ensembles_.append(ens)
 
         return self
 
     def predict(self, X):
-        X_arr = np.nan_to_num(np.array(X, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
-        preds = np.zeros(len(X_arr))
-        for m, w in zip(self.fitted_models_, self.weights_):
-            p = np.nan_to_num(m.predict(X_arr), nan=0.0, posinf=0.0, neginf=0.0)
-            preds += w * p
-        return preds
+        """Average predictions across all seed ensembles."""
+        all_preds = []
+        for ens in self.seed_ensembles_:
+            all_preds.append(ens.predict(X))
+        return np.mean(all_preds, axis=0)
 
 
-# 3.  EVALUATION  (spatial CV with per-fold KNN)
+# ─────────────────────────────────────────────────────────────────────────────
+# 4.  EVALUATION  (leave-station-out CV with per-fold KNN)
+# ─────────────────────────────────────────────────────────────────────────────
 def evaluate_model(df_full, features, target, groups, estimators, use_log,
-                   knn_targets):
-
-    print(f"\n   Evaluating {target} (spatial CV, log={use_log})…")
+                   knn_targets, knn_k=(5, 10)):
+    """Spatial GroupKFold CV with KNN recomputed per fold."""
+    print(f"\n   Evaluating {target} (leave-station-out, log={use_log})…")
 
     y_arr = df_full[target].values.astype(np.float64)
     g_arr = np.array(groups)
@@ -422,41 +1513,51 @@ def evaluate_model(df_full, features, target, groups, estimators, use_log,
     fold_r2, fold_rmse, fold_mae = [], [], []
     fold_train_r2 = []
 
-    for fi, (tri, tei) in enumerate(gkf.split(np.zeros(len(y_arr)), y_arr, g_arr)):
+    for fi, (tri, tei) in enumerate(gkf.split(np.zeros(len(y_arr)),
+                                               y_arr, g_arr)):
         df_tr = df_full.iloc[tri].copy()
         df_te = df_full.iloc[tei].copy()
         y_tr  = y_arr[tri]
         y_te  = y_arr[tei]
         g_tr  = g_arr[tri]
 
-        # Refit KNN on training fold only
-        fold_knn = SpatialKNNEncoder(knn_targets, k_values=(5, 10, 15, 25))
+        # Per-fold KNN
+        fold_knn = SpatialKNNEncoder(knn_targets, k_values=knn_k)
         fold_knn.fit(df_tr)
         df_tr = fold_knn.transform(df_tr, is_train=True)
         df_te = fold_knn.transform(df_te, is_train=False)
 
-        # Build feature list including KNN columns
         all_feats = [f for f in df_tr.columns
                      if f in features
-                     or '_knn' in f or '_nn_dist' in f]
+                     or f.startswith('knn') or f == 'nn_dist_km']
         all_feats = [f for f in all_feats if f not in config.TARGETS]
         all_feats = list(dict.fromkeys(all_feats))
 
-        X_tr = np.nan_to_num(np.array(df_tr[all_feats], dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
-        X_te = np.nan_to_num(np.array(df_te[all_feats], dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+        X_tr = np.array(df_tr[all_feats], dtype=np.float64)
+        X_te = np.array(df_te[all_feats], dtype=np.float64)
 
         y_fit = np.log1p(np.clip(y_tr, 0, None)) if use_log else y_tr
 
-        ens = WeightedEnsemble(estimators)
         print(f"\n   ── Fold {fi+1}/{n_splits} "
               f"(train={len(tri)}, test={len(tei)}, "
-              f"train_locs={len(set(g_tr))}, "
-              f"test_locs={len(set(g_arr[tei]))}) ──")
-        ens.fit(X_tr, y_fit, groups=g_tr)
+              f"train_locs={len(set(g_tr))}) ──")
 
-        preds_raw = ens.predict(X_te)
+        # Train a StackingEnsemble on this fold (matches submission model)
+        fold_stack = StackingEnsemble(estimators, n_folds=min(3, len(set(g_tr))))
+        X_tr_fix = np.where(np.isinf(X_tr), 0.0, X_tr)
+        X_te_fix = np.where(np.isinf(X_te), 0.0, X_te)
+        try:
+            fold_stack.fit(X_tr_fix, y_fit, groups=g_tr)
+            preds_raw = fold_stack.predict(X_te_fix)
+        except Exception as e:
+            warnings.warn(f"   StackingEnsemble failed in fold {fi+1}: {e}")
+            # Fallback: simple XGB
+            m_fb = clone(estimators[0][1])
+            m_fb.fit(np.nan_to_num(X_tr_fix, nan=0.0), y_fit)
+            preds_raw = m_fb.predict(np.nan_to_num(X_te_fix, nan=0.0))
+
         preds = np.expm1(preds_raw) if use_log else preds_raw
-        y_cap = float(np.max(y_tr)) * 2          # safety cap
+        y_cap = float(np.max(y_tr)) * 2
         preds = np.clip(preds, 0, y_cap)
         preds = np.nan_to_num(preds, nan=0.0, posinf=y_cap, neginf=0.0)
 
@@ -466,36 +1567,79 @@ def evaluate_model(df_full, features, target, groups, estimators, use_log,
         fold_r2.append(r2); fold_rmse.append(rmse); fold_mae.append(mae)
 
         # Train diagnostic
-        tr_p = ens.predict(X_tr)
-        if use_log:
-            tr_p = np.expm1(tr_p)
-        tr_p = np.nan_to_num(np.clip(tr_p, 0, y_cap), nan=0.0, posinf=y_cap, neginf=0.0)
+        tr_preds_raw = fold_stack.predict(X_tr_fix) if hasattr(fold_stack, 'predict') else preds_raw[:len(tri)]
+        tr_p = np.expm1(tr_preds_raw) if use_log else tr_preds_raw
+        tr_p = np.nan_to_num(np.clip(tr_p, 0, y_cap),
+                             nan=0.0, posinf=y_cap, neginf=0.0)
         tr_r2 = r2_score(y_tr, tr_p)
         fold_train_r2.append(tr_r2)
         gap = tr_r2 - r2
         print(f"      Fold {fi+1}: Train R²={tr_r2:.4f}  Test R²={r2:.4f}  "
               f"Gap={gap:.4f}  RMSE={rmse:.1f}")
-        if gap > 0.3:
-            print(f"      WARNING: Train-Test gap > 0.3 -> overfitting!")
 
     mr2 = np.mean(fold_r2)
     mg  = np.mean(fold_train_r2) - mr2
-    print(f"\n   CV ({n_splits}-fold):  R²={mr2:.4f} (±{np.std(fold_r2):.3f})  "
+    print(f"\n   CV ({n_splits}-fold):  R²={mr2:.4f} "
+          f"(±{np.std(fold_r2):.3f})  "
           f"RMSE={np.mean(fold_rmse):.1f}  MAE={np.mean(fold_mae):.1f}")
     print(f"   Avg Train R²={np.mean(fold_train_r2):.4f}  Avg Gap={mg:.4f}")
     return mr2, np.mean(fold_rmse)
 
 
-# 4.  FEATURE IMPORTANCE PRUNING
-def prune_features(X, y, features, use_log, min_features=50):
+# ─────────────────────────────────────────────────────────────────────────────
+# 5.  FEATURE IMPORTANCE PRUNING
+# ─────────────────────────────────────────────────────────────────────────────
+def _drop_station_constant_features(df, features, groups, threshold=0.03):
+    """Drop features that are constant within stations (station fingerprints).
+
+    A feature that has near-zero within-group variance relative to total
+    variance is essentially a station ID in disguise.  These cause massive
+    overfitting in leave-station-out CV.
+
+    threshold: minimum ratio of within-group std to total std to keep.
+    """
+    g_arr = np.array(groups)
+    kept, dropped = [], []
+    for f in features:
+        if f not in df.columns:
+            continue
+        vals = pd.to_numeric(df[f], errors='coerce')
+        total_std = vals.std()
+        if total_std < 1e-8:
+            dropped.append(f)
+            continue
+        # Compute mean within-group std
+        within_std = vals.groupby(g_arr).transform('std').mean()
+        ratio = within_std / total_std
+        if ratio < threshold:
+            dropped.append(f)
+        else:
+            kept.append(f)
+    if dropped:
+        print(f"   Dropped {len(dropped)} station-constant features "
+              f"(within/total std ratio < {threshold})")
+        if len(dropped) <= 20:
+            print(f"      Dropped: {dropped}")
+    return kept
+
+
+def prune_features(X, y, features, use_log, groups=None, min_features=30):
+    """Quick XGB fit → drop zero-importance + station-constant features."""
+
+    # First drop station-constant features if groups are provided
+    if groups is not None and isinstance(X, pd.DataFrame):
+        features = _drop_station_constant_features(X, features, groups)
+
     y_fit = np.log1p(np.clip(y, 0, None)) if use_log else y
     m = xgb.XGBRegressor(
-        n_estimators=200, learning_rate=0.05, max_depth=4,
-        min_child_weight=20, subsample=0.7, colsample_bytree=0.5,
+        n_estimators=200, learning_rate=0.05, max_depth=3,
+        min_child_weight=50, subsample=0.6, colsample_bytree=0.3,
         tree_method='hist', random_state=42, n_jobs=-1,
     )
-    X_arr = np.array(X, dtype=np.float64)
-    X_arr = np.nan_to_num(X_arr, nan=0.0, posinf=0.0, neginf=0.0)
+    X_arr = np.array(X[features] if isinstance(X, pd.DataFrame) else X,
+                     dtype=np.float64)
+    # Fix inf only; XGB handles NaN natively
+    X_arr = np.where(np.isinf(X_arr), 0.0, X_arr)
     m.fit(X_arr, np.array(y_fit, dtype=np.float64))
     imps = m.feature_importances_
 
@@ -507,196 +1651,65 @@ def prune_features(X, y, features, use_log, min_features=50):
         need = min_features - len(keep)
         keep.extend(dropped[:need])
         dropped = dropped[need:]
-        print(f"   Kept {need} zero-gain features to meet min_features={min_features}")
 
     if dropped:
-        print(f"   Pruned {len(dropped)} zero-gain features: "
-              f"{dropped[:10]}{'...' if len(dropped) > 10 else ''}")
-    print(f"   Keeping {len(keep)} features (min target: {min_features})")
+        print(f"   Pruned {len(dropped)} zero-gain features")
+    print(f"   Keeping {len(keep)} features")
     return keep
 
 
-# 4b. CROSS-TARGET FEATURES  (exploit inter-target correlations)
-def check_target_correlations(df, targets):
-    present = [t for t in targets if t in df.columns]
-    if len(present) < 2:
-        print("   Only one target present — skipping correlation check.")
-        return {}
+# ─────────────────────────────────────────────────────────────────────────────
+# 6.  OPTUNA HYPERPARAMETER SEARCH
+# ─────────────────────────────────────────────────────────────────────────────
+def _optuna_search(X, y, groups, use_log, target_name, n_trials=80):
+    """Optuna search over XGB hyperparameters with spatial regularization.
 
-    valid = df[present].dropna()
-    print(f"   Rows with all targets present: {len(valid)}/{len(df)}")
-    if len(valid) < 30:
-        print("   Too few complete rows — skipping.")
-        return {}
-
-    corr_info = {}
-    print("   ┌────────────────────────────────────────────────────────────────────┐")
-    print("   │                  Target–Target Correlations                        │")
-    print("   ├───────────────────────────────┬──────────┬───────────┬─────────────┤")
-    print("   │ Pair                          │ Pearson  │ Spearman  │ Exploitable │")
-    print("   ├───────────────────────────────┼──────────┼───────────┼─────────────┤")
-    for i in range(len(present)):
-        for j in range(i + 1, len(present)):
-            t1, t2 = present[i], present[j]
-            pair = valid[[t1, t2]].dropna()
-            pearson_r, _ = sp_stats.pearsonr(pair[t1], pair[t2])
-            spearman_r, _ = sp_stats.spearmanr(pair[t1], pair[t2])
-            exploitable = abs(spearman_r) > 0.15
-            flag = " YES" if exploitable else " NO"
-            # Truncate names for display
-            n1 = t1[:12]
-            n2 = t2[:12]
-            label = f"{n1}<->{n2}"
-            print(f"   │ {label:<25s} │ {pearson_r:>+7.3f}  │ {spearman_r:>+8.3f}  │ {flag:>11s} │")
-            corr_info[(t1, t2)] = {
-                'pearson': pearson_r, 'spearman': spearman_r,
-                'exploitable': exploitable,
-            }
-    print("   └───────────────────────────────┴──────────┴───────────┴─────────────┘")
-
-    any_exploit = any(v['exploitable'] for v in corr_info.values())
-    if any_exploit:
-        print("   At least one pair has |Spearman rho| > 0.15 -> enabling cross-target features.")
-    else:
-        print("   No strong cross-target correlations -> cross-target features would add noise.")
-    return corr_info
-
-
-class CrossTargetFeaturizer:
-
-    def __init__(self, targets, enabled_pairs=None):
-        self.targets = targets
-        self.enabled_pairs = enabled_pairs
-        self.fitted_models_ = {}   # target → fitted model
-        self.oof_predictions_ = {} # target → OOF array (indexed like df)
-
-    def _is_useful(self, src_target, dst_target):
-        if self.enabled_pairs is None:
-            return True
-        key = (src_target, dst_target)
-        rev_key = (dst_target, src_target)
-        info = self.enabled_pairs.get(key) or self.enabled_pairs.get(rev_key)
-        return info is not None and info['exploitable']
-
-    def fit_oof(self, df, features, groups):
-        df = df.copy()
-        self.features_ = list(features)  # Save for test-time alignment
-        X = np.nan_to_num(np.array(df[features], dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
-        g = np.array(groups)
-        n_groups = len(set(g))
-        n_splits = min(5, n_groups)
-        if n_splits < 2:
-            print("   CrossTarget: too few groups for OOF — skipping.")
-            return df
-
-        gkf = GroupKFold(n_splits=n_splits)
-
-        for t in self.targets:
-            if t not in df.columns:
-                continue
-
-            y = df[t].values.astype(np.float64)
-            mask = ~np.isnan(y)
-            if mask.sum() < 50:
-                continue
-
-            # Lightweight Ridge pipeline for OOF
-            pipe = Pipeline([
-                ('imputer', SimpleImputer(strategy='median')),
-                ('scaler', StandardScaler()),
-                ('ridge', Ridge(alpha=10.0)),
-            ])
-
-            # Generate OOF predictions
-            oof = np.full(len(df), np.nan)
-            for tri, tei in gkf.split(X, y, g):
-                # Only fit on rows where target is not NaN
-                tri_valid = tri[mask[tri]]
-                if len(tri_valid) < 10:
-                    continue
-                p = clone(pipe)
-                p.fit(X[tri_valid], np.log1p(np.clip(y[tri_valid], 0, None)))
-                oof[tei] = p.predict(X[tei])
-
-            self.oof_predictions_[t] = oof
-
-            # Fit final model on all data for test-time predictions
-            valid_idx = np.where(mask)[0]
-            final_pipe = clone(pipe)
-            final_pipe.fit(X[valid_idx], np.log1p(np.clip(y[valid_idx], 0, None)))
-            self.fitted_models_[t] = final_pipe
-
-        # Add cross-target columns
-        added = 0
-        for dst_target in self.targets:
-            for src_target in self.targets:
-                if src_target == dst_target:
-                    continue
-                if not self._is_useful(src_target, dst_target):
-                    continue
-                col_name = f'xt_{src_target[:8].replace(" ", "")}'
-                if src_target in self.oof_predictions_:
-                    df[col_name] = self.oof_predictions_[src_target]
-                    added += 1
-
-        # De-duplicate column names (some might appear more than once)
-        added_cols = [c for c in df.columns if c.startswith('xt_')]
-        added_cols = list(dict.fromkeys(added_cols))
-        print(f"   CrossTarget: added {len(added_cols)} OOF feature columns: {added_cols}")
-        return df
-
-    def transform_test(self, test_df, features):
-        test_df = test_df.copy()
-
-        aligned_feats = self.features_ if hasattr(self, 'features_') else features
-        for f in aligned_feats:
-            if f not in test_df.columns:
-                test_df[f] = np.nan
-        X = np.nan_to_num(np.array(test_df[aligned_feats], dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
-
-        for t in self.targets:
-            if t not in self.fitted_models_:
-                continue
-            col_name = f'xt_{t[:8].replace(" ", "")}'
-            test_df[col_name] = self.fitted_models_[t].predict(X)
-
-        return test_df
-
-    def get_feature_names(self):
-        names = []
-        for t in self.targets:
-            if t in self.fitted_models_:
-                names.append(f'xt_{t[:8].replace(" ", "")}')
-        return list(dict.fromkeys(names))
-
-
-# 5.  OPTUNA SEARCH  (conservative search space)
-def _optuna_search(X, y, groups, use_log, target_name, n_trials=30):
+    Uses subsampling (max 40K rows) for speed — standard practice for
+    hyperparameter search on large datasets.
+    """
     if not HAS_OPTUNA:
-        print("   Optuna not installed – using default hyperparams.")
         return None
 
-    print(f"   Running Optuna ({n_trials} trials, conservative bounds)…")
+    print(f"   Running Optuna ({n_trials} trials)…")
     y_fit = np.log1p(np.clip(y, 0, None)) if use_log else y
-    X_arr = np.nan_to_num(np.array(X, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+    X_arr = np.array(X, dtype=np.float64)
+    X_arr = np.where(np.isinf(X_arr), 0.0, X_arr)  # fix inf, keep NaN
     y_arr = np.array(y_fit, dtype=np.float64)
     g_arr = np.array(groups)
 
+    # Subsample for speed (40K rows max, preserving group structure)
+    MAX_OPTUNA_ROWS = 40000
+    if len(y_arr) > MAX_OPTUNA_ROWS:
+        rng = np.random.RandomState(42)
+        unique_groups = list(set(g_arr))
+        rng.shuffle(unique_groups)
+        keep_mask = np.zeros(len(y_arr), dtype=bool)
+        for g in unique_groups:
+            keep_mask |= (g_arr == g)
+            if keep_mask.sum() >= MAX_OPTUNA_ROWS:
+                break
+        X_arr = X_arr[keep_mask]
+        y_arr = y_arr[keep_mask]
+        g_arr = g_arr[keep_mask]
+        print(f"   Optuna subsampled to {len(y_arr)} rows "
+              f"({len(set(g_arr))} groups)")
+
     n_groups = len(set(g_arr))
-    n_splits = min(4, n_groups)
+    n_splits = min(3, n_groups)  # 3-fold for speed
     gkf = GroupKFold(n_splits=n_splits)
 
     def objective(trial):
         params = {
-            'n_estimators': 2000,
-            'learning_rate': trial.suggest_float('lr', 0.005, 0.05, log=True),
+            'n_estimators': trial.suggest_int('n_est', 500, 1500),
+            'learning_rate': trial.suggest_float('lr', 0.01, 0.08, log=True),
             'max_depth': trial.suggest_int('max_depth', 3, 5),
-            'min_child_weight': trial.suggest_int('mcw', 20, 60),
-            'subsample': trial.suggest_float('subsample', 0.5, 0.7),
-            'colsample_bytree': trial.suggest_float('colsample', 0.25, 0.5),
-            'reg_alpha': trial.suggest_float('alpha', 1.0, 20.0, log=True),
-            'reg_lambda': trial.suggest_float('lambda', 2.0, 30.0, log=True),
-            'gamma': trial.suggest_float('gamma', 0.5, 5.0),
+            'min_child_weight': trial.suggest_int('mcw', 40, 200),
+            'subsample': trial.suggest_float('subsample', 0.55, 0.8),
+            'colsample_bytree': trial.suggest_float('colsample', 0.2, 0.45),
+            'reg_alpha': trial.suggest_float('alpha', 3.0, 60.0, log=True),
+            'reg_lambda': trial.suggest_float('lambda', 5.0, 100.0, log=True),
+            'gamma': trial.suggest_float('gamma', 0.5, 10.0),
+            'max_delta_step': trial.suggest_float('max_delta_step', 1.0, 8.0),
             'tree_method': 'hist', 'n_jobs': -1, 'random_state': 42,
         }
         scores = []
@@ -710,129 +1723,346 @@ def _optuna_search(X, y, groups, use_log, target_name, n_trials=30):
                 y_real = np.expm1(y_arr[va])
             else:
                 preds_real, y_real = preds, y_arr[va]
-            y_cap_opt = float(np.max(y_real)) * 2
-            preds_real = np.nan_to_num(np.clip(preds_real, 0, y_cap_opt),
-                                       nan=0.0, posinf=y_cap_opt, neginf=0.0)
+            y_cap = float(np.max(y_real)) * 2
+            preds_real = np.nan_to_num(np.clip(preds_real, 0, y_cap),
+                                       nan=0.0, posinf=y_cap, neginf=0.0)
             scores.append(r2_score(y_real, preds_real))
         return np.mean(scores)
 
     study = optuna.create_study(direction='maximize',
-                                 sampler=optuna.samplers.TPESampler(seed=42))
-    study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
+                                sampler=optuna.samplers.TPESampler(seed=42))
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=True,
+                   n_jobs=1)  # XGB already uses all cores
 
     best = study.best_params
-    # Rename back from short names
     best['learning_rate'] = best.pop('lr')
     best['min_child_weight'] = best.pop('mcw')
     best['colsample_bytree'] = best.pop('colsample')
     best['reg_alpha'] = best.pop('alpha')
     best['reg_lambda'] = best.pop('lambda')
-    best['n_estimators'] = 3000
+    best['n_estimators'] = best.pop('n_est')
     print(f"   Best Optuna R²: {study.best_value:.4f}")
     print(f"   Best params: {best}")
     return best
 
 
-# 6.  MAIN ENTRY POINT
+def _optuna_search_lgb(X, y, groups, use_log, target_name, n_trials=50):
+    """Optuna search over LightGBM hyperparameters."""
+    if not HAS_OPTUNA or not HAS_LGB:
+        return None
+
+    print(f"   Running Optuna-LGB ({n_trials} trials)…")
+    y_fit = np.log1p(np.clip(y, 0, None)) if use_log else y
+    X_arr = np.array(X, dtype=np.float64)
+    X_arr = np.where(np.isinf(X_arr), 0.0, X_arr)
+    y_arr = np.array(y_fit, dtype=np.float64)
+    g_arr = np.array(groups)
+
+    # Subsample for speed
+    MAX_ROWS = 40000
+    if len(y_arr) > MAX_ROWS:
+        rng = np.random.RandomState(42)
+        unique_groups = list(set(g_arr))
+        rng.shuffle(unique_groups)
+        keep_mask = np.zeros(len(y_arr), dtype=bool)
+        for g in unique_groups:
+            keep_mask |= (g_arr == g)
+            if keep_mask.sum() >= MAX_ROWS:
+                break
+        X_arr, y_arr, g_arr = X_arr[keep_mask], y_arr[keep_mask], g_arr[keep_mask]
+        print(f"   Optuna-LGB subsampled to {len(y_arr)} rows")
+
+    n_groups = len(set(g_arr))
+    n_splits = min(3, n_groups)
+    gkf = GroupKFold(n_splits=n_splits)
+
+    is_drp = 'Phosphorus' in target_name
+
+    def objective(trial):
+        params = {
+            'n_estimators': trial.suggest_int('n_est', 500, 1500),
+            'learning_rate': trial.suggest_float('lr', 0.01, 0.08, log=True),
+            'num_leaves': trial.suggest_int('num_leaves', 8, 31),
+            'max_depth': trial.suggest_int('max_depth', 3, 6),
+            'min_child_samples': trial.suggest_int('mcs', 40, 200),
+            'subsample': trial.suggest_float('subsample', 0.55, 0.8),
+            'colsample_bytree': trial.suggest_float('colsample', 0.2, 0.45),
+            'reg_alpha': trial.suggest_float('alpha', 3.0, 60.0, log=True),
+            'reg_lambda': trial.suggest_float('lambda', 5.0, 100.0, log=True),
+            'n_jobs': -1, 'random_state': 42, 'verbose': -1,
+        }
+        if is_drp:
+            params['objective'] = 'huber'
+            params['alpha'] = trial.suggest_float('huber_delta', 0.5, 5.0)
+
+        scores = []
+        for tr, va in gkf.split(X_arr, y_arr, g_arr):
+            m = lgb.LGBMRegressor(**params)
+            m.fit(X_arr[tr], y_arr[tr],
+                  eval_set=[(X_arr[va], y_arr[va])],
+                  callbacks=[lgb.log_evaluation(-1)])
+            preds = m.predict(X_arr[va])
+            if use_log:
+                preds_real = np.expm1(preds)
+                y_real = np.expm1(y_arr[va])
+            else:
+                preds_real, y_real = preds, y_arr[va]
+            y_cap = float(np.max(y_real)) * 2
+            preds_real = np.nan_to_num(np.clip(preds_real, 0, y_cap),
+                                       nan=0.0, posinf=y_cap, neginf=0.0)
+            scores.append(r2_score(y_real, preds_real))
+        return np.mean(scores)
+
+    study = optuna.create_study(direction='maximize',
+                                sampler=optuna.samplers.TPESampler(seed=43))
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=True,
+                   n_jobs=1)
+
+    best = study.best_params
+    best['learning_rate'] = best.pop('lr')
+    best['min_child_samples'] = best.pop('mcs')
+    best['colsample_bytree'] = best.pop('colsample')
+    best['reg_alpha'] = best.pop('alpha', best.get('reg_alpha', 10.0))
+    best['reg_lambda'] = best.pop('lambda')
+    best['n_estimators'] = best.pop('n_est')
+    if 'huber_delta' in best:
+        best['alpha'] = best.pop('huber_delta')
+    print(f"   Best Optuna-LGB R²: {study.best_value:.4f}")
+    print(f"   Best LGB params: {best}")
+    return best
+
+
+def _optuna_search_cb(X, y, groups, use_log, target_name, n_trials=40):
+    """Optuna search over CatBoost hyperparameters."""
+    if not HAS_OPTUNA or not HAS_CB:
+        return None
+
+    print(f"   Running Optuna-CB ({n_trials} trials)…")
+    y_fit = np.log1p(np.clip(y, 0, None)) if use_log else y
+    X_arr = np.array(X, dtype=np.float64)
+    X_arr = np.where(np.isinf(X_arr), 0.0, X_arr)
+    # CatBoost cannot handle NaN in float64 arrays — fill them
+    X_arr = np.nan_to_num(X_arr, nan=0.0)
+    y_arr = np.array(y_fit, dtype=np.float64)
+    g_arr = np.array(groups)
+
+    MAX_ROWS = 40000
+    if len(y_arr) > MAX_ROWS:
+        rng = np.random.RandomState(42)
+        unique_groups = list(set(g_arr))
+        rng.shuffle(unique_groups)
+        keep_mask = np.zeros(len(y_arr), dtype=bool)
+        for g in unique_groups:
+            keep_mask |= (g_arr == g)
+            if keep_mask.sum() >= MAX_ROWS:
+                break
+        X_arr, y_arr, g_arr = X_arr[keep_mask], y_arr[keep_mask], g_arr[keep_mask]
+        print(f"   Optuna-CB subsampled to {len(y_arr)} rows")
+
+    n_groups = len(set(g_arr))
+    n_splits = min(3, n_groups)
+    gkf = GroupKFold(n_splits=n_splits)
+
+    is_drp = 'Phosphorus' in target_name
+
+    def objective(trial):
+        params = {
+            'iterations': trial.suggest_int('iters', 500, 1500),
+            'learning_rate': trial.suggest_float('lr', 0.01, 0.08, log=True),
+            'depth': trial.suggest_int('depth', 3, 6),
+            'l2_leaf_reg': trial.suggest_float('l2', 5.0, 100.0, log=True),
+            'subsample': trial.suggest_float('subsample', 0.55, 0.8),
+            'colsample_bylevel': trial.suggest_float('colsample', 0.2, 0.45),
+            'min_data_in_leaf': trial.suggest_int('mdil', 40, 200),
+            'random_seed': 42, 'verbose': 0,
+        }
+        if is_drp:
+            delta = trial.suggest_float('huber_delta', 0.5, 5.0)
+            params['loss_function'] = f'Huber:delta={delta}'
+
+        scores = []
+        for tr, va in gkf.split(X_arr, y_arr, g_arr):
+            m = CatBoostRegressor(**params)
+            m.fit(X_arr[tr], y_arr[tr],
+                  eval_set=(X_arr[va], y_arr[va]),
+                  verbose=0)
+            preds = m.predict(X_arr[va])
+            if use_log:
+                preds_real = np.expm1(preds)
+                y_real = np.expm1(y_arr[va])
+            else:
+                preds_real, y_real = preds, y_arr[va]
+            y_cap = float(np.max(y_real)) * 2
+            preds_real = np.nan_to_num(np.clip(preds_real, 0, y_cap),
+                                       nan=0.0, posinf=y_cap, neginf=0.0)
+            scores.append(r2_score(y_real, preds_real))
+        return np.mean(scores)
+
+    study = optuna.create_study(direction='maximize',
+                                sampler=optuna.samplers.TPESampler(seed=44))
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=True,
+                   n_jobs=1)
+
+    best = study.best_params
+    best['learning_rate'] = best.pop('lr')
+    best['l2_leaf_reg'] = best.pop('l2')
+    best['colsample_bylevel'] = best.pop('colsample')
+    best['iterations'] = best.pop('iters')
+    best['min_data_in_leaf'] = best.pop('mdil')
+    if is_drp and 'huber_delta' in best:
+        delta = best.pop('huber_delta')
+        best['loss_function'] = f'Huber:delta={delta}'
+    print(f"   Best Optuna-CB R²: {study.best_value:.4f}")
+    print(f"   Best CB params: {best}")
+    return best
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7.  MAIN ENTRY POINT
+# ─────────────────────────────────────────────────────────────────────────────
 def train_models(df, log_transform=None, use_optuna=True, dws_context=None):
-    print("\n== Feature Engineering ==")
-    df = engineer_features(df)
+    """
+    v6 DWS-centric training.
 
-    if dws_context is not None:
-        import dws_data as dws_mod
+    df          : competition training data (enriched with satellite/terrain/weather)
+    dws_context : dict with 'all_dws', 'station_features', 'aug_rows'
+    """
+    print("\n══════════════════════════════════════════════════════════════")
+    print("   v6 DWS-CENTRIC MODELLING")
+    print("══════════════════════════════════════════════════════════════")
 
-        all_dws          = dws_context['all_dws']
-        station_features = dws_context['station_features']
-        aug_rows         = dws_context['aug_rows']
+    if dws_context is None:
+        print("   ⚠ No DWS context — falling back to competition data only")
+        return _train_models_basic(df, log_transform, use_optuna)
 
-        print("\n== DWS Integration ==")
+    all_dws = dws_context['all_dws']
+    exclude_dates = dws_context.get('test_dates_by_stn', {})
 
-        # 1. Add augmented training rows from DWS
-        if aug_rows is not None and len(aug_rows) > 0:
-            aug = aug_rows.copy()
-            aug = engineer_features(aug)
-            pre_len = len(df)
-            df = pd.concat([df, aug], ignore_index=True)
-            print(f"   Augmented training: {pre_len} -> {len(df)} rows "
-                  f"(+{len(aug)} DWS rows at test locations)")
+    # ── Steps 1-5: Build combined training set (DWS + competition) ───────
+    #    Cached to disk so repeated runs skip the expensive construction.
+    COMBINED_CACHE = "combined_training_cache.parquet"
 
-        # 2. Assign DWS station codes
-        df['_dws_station'] = df.apply(
-            lambda r: dws_mod.coord_to_station(r['Latitude'], r['Longitude']),
-            axis=1,
-        )
-        n_matched = df['_dws_station'].notna().sum()
-        print(f"   DWS station match: {n_matched}/{len(df)} rows")
+    if os.path.exists(COMBINED_CACHE):
+        print(f"\n── Loading cached combined training set from {COMBINED_CACHE} ──")
+        combined_df = pd.read_parquet(COMBINED_CACHE)
+        print(f"   {len(combined_df)} rows, {len(combined_df.columns)} columns")
+    else:
+        # ── 1. Build DWS-based training set ──────────────────────────────
+        print("\n── Step 1: Building DWS training dataset ──")
+        dws_df = build_dws_training_set(all_dws, config.TARGETS,
+                                        exclude_dates=exclude_dates)
 
-        # 3. Merge station-level features (IDW for non-matched rows)
-        df = dws_mod.merge_station_features(df, station_features)
+        # ── 2. Add station historical features ───────────────────────────
+        print("\n── Step 2: Station historical features ──")
+        dws_df = add_station_historical_features(dws_df, all_dws)
 
-        # 4. Add per-row lag features
-        df = dws_mod.add_lag_features(df, all_dws, config.TARGETS)
+        # ── 2b. Add time-weighted station features ───────────────────────
+        print("\n── Step 2b: Time-weighted station features ──")
+        dws_df = add_time_weighted_station_features(dws_df, all_dws,
+                                                     halflife_days=730)
 
-        # 5. Add same-day auxiliary features to ALL training rows
-        df = dws_mod.add_sameday_aux_features(df, all_dws)
+        # ── 2c. Add neighbor/upstream features ───────────────────────────
+        print("\n── Step 2c: Neighbor/upstream features ──")
+        import dws_data as _dws_mod
+        dws_df = _dws_mod.build_neighbor_features(dws_df, all_dws)
 
-    print("\n== Cross-Target Correlation Analysis ==")
-    corr_info = check_target_correlations(df, config.TARGETS)
-    use_cross_target = any(v['exploitable'] for v in corr_info.values()) if corr_info else False
+        # ── 3. Add enrichment features (satellite, terrain, weather) ─────
+        #       by merging from the competition enriched data
+        print("\n── Step 3: Merging enrichment features ──")
+        dws_df = _merge_enrichment_to_dws(dws_df, df)
 
-    # KNN 
-    print("\n== KNN Spatial Features ==")
-    knn_enc = SpatialKNNEncoder(config.TARGETS, k_values=(5, 10, 15, 25))
-    knn_enc.fit(df)
-    df_with_knn = knn_enc.transform(df, is_train=True)
-    knn_cols = [c for c in df_with_knn.columns
-                if '_knn' in c or '_nn_dist' in c]
+        # ── 4. Engineer derived features ─────────────────────────────────
+        print("\n── Step 4: Feature engineering ──")
+        dws_df = engineer_features(dws_df)
+
+        # ── 5. Also include competition training data ────────────────────
+        #       (adds diversity from 162 non-test locations)
+        print("\n── Step 5: Combining with competition training data ──")
+        comp_df = _prepare_competition_data(df, all_dws, dws_df)
+
+        if comp_df is not None and len(comp_df) > 0:
+            combined_df = pd.concat([dws_df, comp_df], ignore_index=True)
+            print(f"   Combined: {len(dws_df)} DWS + {len(comp_df)} competition "
+                  f"= {len(combined_df)} total rows")
+        else:
+            combined_df = dws_df
+            print(f"   Using DWS data only: {len(combined_df)} rows")
+
+        # Cache to disk
+        # Ensure 'Sample Date' is string type for parquet serialisation
+        if 'Sample Date' in combined_df.columns:
+            combined_df['Sample Date'] = combined_df['Sample Date'].astype(str)
+        combined_df.to_parquet(COMBINED_CACHE, index=False)
+        print(f"   Cached combined training set to {COMBINED_CACHE} "
+              f"({os.path.getsize(COMBINED_CACHE)/1e6:.1f} MB)")
+
+    # ── 6. KNN spatial features (chemistry-based, fit on full combined data) ─
+    print("\n── Step 6: KNN spatial features (chemistry-based) ──")
+    knn_enc = SpatialKNNEncoder(config.TARGETS, k_values=(5, 10))
+    knn_enc.fit(combined_df)
+    combined_knn = knn_enc.transform(combined_df, is_train=True)
+    knn_cols = [c for c in combined_knn.columns
+                if c.startswith('knn') or c == 'nn_dist_km']
     print(f"   Added {len(knn_cols)} KNN features")
 
-    # Feature selection
-    always_drop = ['Sample Date', 'key', '_dt', '_loc_id', '_enc_loc_id',
+    # ── Feature selection ────────────────────────────────────────────────
+    always_drop = ['Sample Date', '_station', '_dt', '_loc_id', '_enc_loc_id',
                    '_is_missing', '_geo_key', 'Latitude', 'Longitude',
-                   '_dws_station', 'date', 'station']
-    dead_feats = getattr(config, 'DEAD_FEATURES', [])
-    drop_cols = config.TARGETS + always_drop + dead_feats
-    base_features = [c for c in df.columns
+                   '_dws_station', 'date', 'station', 'key']
+    drop_cols = config.TARGETS + always_drop
+    base_features = [c for c in combined_df.columns
                      if c not in drop_cols
-                     and pd.api.types.is_numeric_dtype(df[c])]
-    print(f"   Base features ({len(base_features)}): {base_features[:15]}...")
+                     and pd.api.types.is_numeric_dtype(combined_df[c])]
+    print(f"   Base features: {len(base_features)}")
 
-    # ── Cross-target OOF features ────────────────────────────────────────
-    xt_featurizer = None
-    if use_cross_target:
-        print("\n══ Cross-Target OOF Features ══")
-        # Use full df with all rows to generate OOF cross-target predictions
-        groups_all = (df['Latitude'].round(2).astype(str) + "_" +
-                      df['Longitude'].round(2).astype(str))
-        xt_featurizer = CrossTargetFeaturizer(
-            config.TARGETS, enabled_pairs=corr_info)
-        df = xt_featurizer.fit_oof(df, base_features, groups_all)
-        xt_cols = xt_featurizer.get_feature_names()
-    else:
-        xt_cols = []
-        print("\n   Cross-target features: DISABLED (correlations too weak)")
+    # ── 7. Train per-target models (CHAINED: EC → TAL → DRP) ──────────
+    import dws_data as dws_mod
+    DWS_COL_MAP_INV = {v: k for k, v in dws_mod.DWS_COL_MAP.items()}
+
+    # Determine test station set for sample weighting
+    test_stations = set(dws_context.get('test_dates_by_stn', {}).keys())
 
     performance_report = {
         '_knn_encoder': knn_enc,
-        '_xt_featurizer': xt_featurizer,
+        '_xt_featurizer': None,
         '_base_features': base_features,
         '_dws_context': dws_context,
+        '_lstm_models': {},
+        '_chain_order': CHAIN_ORDER,
     }
 
-    for target in config.TARGETS:
-        if target not in df.columns:
+    # Store OOF chain predictions to use as features for downstream targets
+    chain_oof_preds = {}  # {target: pd.Series of OOF predictions}
+
+    # Use CHAIN_ORDER (EC → TAL → DRP) instead of config.TARGETS
+    for target in CHAIN_ORDER:
+        if target not in combined_df.columns:
             continue
 
         print(f"\n{'='*65}")
         print(f"   TARGET: {target}")
         print(f"{'='*65}")
 
-        estimators, auto_log = _get_models_for_target(target)
-        use_log = auto_log if log_transform is None else log_transform
+        estimators, target_tf = _get_models_for_target(target)
+        # log_transform override: None means use the target-specific transform
+        use_log = True  # kept for backward compat with evaluate/prune
+        tf_method = target_tf.method
 
-        tdf = df.dropna(subset=[target]).copy()
-        groups = (tdf['Latitude'].round(2).astype(str) + "_" +
-                  tdf['Longitude'].round(2).astype(str))
+        tdf = combined_df.dropna(subset=[target]).copy()
+
+        # ── Multi-target chaining: add upstream predictions as features ──
+        for prev_target, prev_preds in chain_oof_preds.items():
+            chain_col = f'_chain_{prev_target[:3].upper()}'
+            tdf[chain_col] = prev_preds.reindex(tdf.index).values
+            n_valid_chain = tdf[chain_col].notna().sum()
+            print(f"   Chained feature {chain_col}: "
+                  f"{n_valid_chain}/{len(tdf)} valid")
+
+        # Groups = station (for DWS rows) or lat_lon (for competition rows)
+        groups = tdf['_station'].fillna(
+            tdf['Latitude'].round(2).astype(str) + "_" +
+            tdf['Longitude'].round(2).astype(str)
+        )
 
         y = tdf[target].copy()
 
@@ -841,69 +2071,200 @@ def train_models(df, log_transform=None, use_optuna=True, dws_context=None):
         y = y.clip(lower=lo, upper=hi)
         tdf[target] = y
 
-        keep = ~tdf[base_features].isna().all(axis=1)
-        tdf, y, groups = tdf[keep], y[keep], groups[keep]
+        # ── Station-aware sample weights ─────────────────────────────
+        sample_weights = compute_station_weights(
+            tdf, test_stations,
+            base_weight=1.0, test_station_weight=4.0)
 
-        print(f"   Samples: {len(tdf)},  Locations: {groups.nunique()}")
+        print(f"   Samples: {len(tdf)},  Groups: {groups.nunique()}")
         print(f"   y: mean={y.mean():.2f}  std={y.std():.2f}  "
-              f"skew={y.skew():.2f}  log={use_log}")
-        print(f"   y range: [{y.min():.1f}, {y.max():.1f}] (winsorised)")
+              f"skew={y.skew():.2f}  transform={tf_method}")
 
-        # Cross-target features relevant for THIS target
-        xt_feats_for_target = [c for c in xt_cols
-                               if c in tdf.columns
-                               and c != f'xt_{target[:8].replace(" ", "")}']
-        if xt_feats_for_target:
-            print(f"   Cross-target features for this target: {xt_feats_for_target}")
+        # ── 7a. LSTM temporal model ──────────────────────────────────
+        target_dws_col = DWS_COL_MAP_INV.get(target)
+        lstm_model = None
+        if target_dws_col is not None:
+            print(f"\n   ── Step 7a: Training LSTM for {target} ──")
+            lstm_model = StationLSTMModel(
+                target_dws_col=target_dws_col,
+                target_name=target,
+                use_log=use_log,
+                seq_len=36,
+                hidden=96,
+                n_layers=2,
+                epochs=70,
+                lr=1e-3,
+                batch_size=512,
+            )
+            try:
+                lstm_model.fit(all_dws, tdf, exclude_dates=exclude_dates)
+                lstm_preds = lstm_model.predict(
+                    all_dws, tdf, exclude_dates=exclude_dates)
+                tdf['_lstm_pred'] = lstm_preds
+                n_valid = np.isfinite(lstm_preds).sum()
+                print(f"      LSTM predictions: {n_valid}/{len(tdf)} valid")
+                performance_report['_lstm_models'][target] = lstm_model
+            except Exception as e:
+                print(f"      LSTM failed (non-fatal): {e}")
+                traceback.print_exc()
+                tdf['_lstm_pred'] = np.nan
+                lstm_model = None
 
-        # Prune
-        X_base = tdf[base_features]
-        tgt_base_feats = prune_features(X_base, y, base_features, use_log)
-        tgt_base_feats = tgt_base_feats + xt_feats_for_target  # always include xt features
-        print(f"   Features after pruning + cross-target: {len(tgt_base_feats)}")
+        # Build feature list: base + chain + LSTM
+        tgt_base = list(base_features)
+        chain_cols = [c for c in tdf.columns if c.startswith('_chain_')]
+        tgt_base.extend(chain_cols)
 
+        # Prune — pass groups to also drop station-constant features
+        X_base = tdf[tgt_base]
+        tgt_feats = prune_features(X_base, y, tgt_base, use_log, groups=groups)
+        # Add LSTM prediction as a feature if available
+        if '_lstm_pred' in tdf.columns:
+            tgt_feats.append('_lstm_pred')
+        # Ensure chain features survive pruning
+        for cc in chain_cols:
+            if cc not in tgt_feats:
+                tgt_feats.append(cc)
+        print(f"   Features after pruning: {len(tgt_feats)}")
+
+        # ── 7b. Adversarial validation ───────────────────────────────
+        # Use test_template rows to detect distribution shift
+        try:
+            test_tmpl = dws_context.get('test_template')
+            if test_tmpl is not None and len(test_tmpl) > 0:
+                adv_feats = [f for f in tgt_feats
+                             if not f.startswith('_') and f in tdf.columns
+                             and f in test_tmpl.columns]
+                if len(adv_feats) >= 10:
+                    adv_imp, adv_auc, shift_feats = adversarial_validation(
+                        tdf, test_tmpl, adv_feats, top_k=5)
+                    # If high shift, use adversarial score for sample weighting
+                    # (NOT as feature — avoids leaking "is_test_like" into model)
+                    if adv_auc > 0.7 and HAS_LGB:
+                        print("   Using adversarial score for sample weighting…")
+                        clf_adv = lgb.LGBMClassifier(
+                            n_estimators=100, max_depth=3, n_jobs=-1,
+                            random_state=42, verbose=-1)
+                        X_adv = np.nan_to_num(tdf[adv_feats].values, nan=0.0)
+                        X_test_adv = np.nan_to_num(test_tmpl[adv_feats].values, nan=0.0)
+                        X_all_adv = np.vstack([X_adv, X_test_adv])
+                        y_adv = np.concatenate([np.zeros(len(X_adv)),
+                                                np.ones(len(X_test_adv))])
+                        clf_adv.fit(X_all_adv, y_adv)
+                        adv_scores = clf_adv.predict_proba(X_adv)[:, 1]
+                        # Upweight training rows that look like test data
+                        sample_weights = sample_weights * (1.0 + adv_scores)
+                        print(f"   Adversarial weighting: mean boost={adv_scores.mean():.3f}")
+                        performance_report[f'_adv_classifier_{target}'] = clf_adv
+                        performance_report[f'_adv_features_{target}'] = adv_feats
+        except Exception as e:
+            print(f"   Adversarial validation failed (non-fatal): {e}")
+
+        # Optuna — use only base features (no global KNN to avoid leakage)
         if use_optuna and HAS_OPTUNA:
-            tdf_knn = knn_enc.transform(tdf, is_train=True)
-            optuna_feats = [f for f in tdf_knn.columns
-                           if (f in tgt_base_feats
-                               or '_knn' in f or '_nn_dist' in f)
-                           and f not in config.TARGETS]
+            optuna_feats = [f for f in tgt_feats if f not in config.TARGETS]
             optuna_feats = list(dict.fromkeys(optuna_feats))
-            best_xgb_params = _optuna_search(
-                tdf_knn[optuna_feats], y, groups, use_log, target,
-                n_trials=30)
-            if best_xgb_params is not None:
-                best_xgb_params['tree_method'] = 'hist'
-                best_xgb_params['n_jobs'] = -1
-                best_xgb_params['random_state'] = 42
+            best_xgb = _optuna_search(
+                tdf[optuna_feats], y, groups, use_log, target, n_trials=50)
+            if best_xgb is not None:
+                best_xgb['tree_method'] = 'hist'
+                best_xgb['n_jobs'] = -1
+                best_xgb['random_state'] = 42
+                # Preserve Huber loss for DRP
+                if 'Phosphorus' in target:
+                    best_xgb['objective'] = 'reg:pseudohubererror'
                 estimators = [(n, e) if n != 'xgb' else
-                              ('xgb', xgb.XGBRegressor(**best_xgb_params))
+                              ('xgb', xgb.XGBRegressor(**best_xgb))
                               for n, e in estimators]
 
-        r2, rmse = evaluate_model(tdf, tgt_base_feats, target, groups,
-                                   estimators, use_log, config.TARGETS)
+            # Optuna for LightGBM
+            best_lgb = _optuna_search_lgb(
+                tdf[optuna_feats], y, groups, use_log, target, n_trials=50)
+            if best_lgb is not None:
+                best_lgb['n_jobs'] = -1
+                best_lgb['random_state'] = 42
+                best_lgb['verbose'] = -1
+                if 'Phosphorus' in target and 'objective' not in best_lgb:
+                    best_lgb['objective'] = 'huber'
+                estimators = [(n, e) if n != 'lgb' else
+                              ('lgb', lgb.LGBMRegressor(**best_lgb))
+                              for n, e in estimators]
 
+            # Optuna for CatBoost
+            best_cb = _optuna_search_cb(
+                tdf[optuna_feats], y, groups, use_log, target, n_trials=40)
+            if best_cb is not None:
+                best_cb['random_seed'] = 42
+                best_cb['verbose'] = 0
+                estimators = [(n, e) if n != 'cb' else
+                              ('cb', CatBoostRegressor(**best_cb))
+                              for n, e in estimators]
+
+        # Evaluate
+        r2, rmse = evaluate_model(tdf, tgt_feats, target, groups,
+                                  estimators, use_log, config.TARGETS,
+                                  knn_k=(5, 10))
+
+        # Final fit on ALL data
         print("   Training final model on ALL data…")
         tdf_final = knn_enc.transform(tdf, is_train=True)
         all_feats = [f for f in tdf_final.columns
-                     if (f in tgt_base_feats
-                         or '_knn' in f or '_nn_dist' in f)
+                     if (f in tgt_feats
+                         or f.startswith('knn')
+                         or f == 'nn_dist_km')
                      and f not in config.TARGETS]
         all_feats = list(dict.fromkeys(all_feats))
 
-        y_fit = (np.log1p(np.clip(y, 0, None)) if use_log
-                 else np.array(y, dtype=np.float64))
-        final = WeightedEnsemble(estimators)
-        final.fit(np.nan_to_num(np.array(tdf_final[all_feats], dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0),
-                  np.array(y_fit, dtype=np.float64),
-                  groups=np.array(groups))
+        y_fit = target_tf.fit_transform(y)
+        final = MultiSeedEnsemble(estimators, n_seeds=3, n_folds=5)
+        X_final = np.array(tdf_final[all_feats], dtype=np.float64)
+        # Fix inf only; StackingEnsemble._prepare_X handles NaN per-model
+        X_final = np.where(np.isinf(X_final), 0.0, X_final)
+        final.fit(
+            X_final,
+            np.array(y_fit, dtype=np.float64),
+            groups=np.array(groups),
+            sample_weight=sample_weights)
+
+        # ── Generate OOF chain predictions for downstream targets ────
+        # Quick OOF via StackingEnsemble-style K-fold
+        print("   Generating OOF chain predictions…")
+        try:
+            n_splits_chain = min(5, len(set(groups)))
+            gkf_chain = GroupKFold(n_splits=n_splits_chain)
+            oof_chain = np.full(len(tdf), np.nan)
+            for tri, tei in gkf_chain.split(X_final, y_fit, groups.values):
+                m_chain = clone(xgb.XGBRegressor(
+                    n_estimators=500, learning_rate=0.03, max_depth=4,
+                    tree_method='hist', n_jobs=-1, random_state=42))
+                m_chain.fit(X_final[tri], y_fit[tri])
+                p = m_chain.predict(X_final[tei])
+                # Inverse transform
+                p_orig = target_tf.inverse_transform(p)
+                p_orig = np.clip(np.nan_to_num(p_orig, nan=0.0), 0, None)
+                oof_chain[tei] = p_orig
+            chain_oof_preds[target] = pd.Series(oof_chain, index=tdf.index)
+            print(f"   OOF chain: {np.isfinite(oof_chain).sum()}/{len(oof_chain)} valid, "
+                  f"mean={np.nanmean(oof_chain):.2f}")
+        except Exception as e:
+            print(f"   OOF chain generation failed (non-fatal): {e}")
+
+        # ── Station Calibrator ───────────────────────────────────────
+        calibrator = None
+        if target_dws_col is not None:
+            print(f"   Training station calibrator for {target}…")
+            calibrator = StationCalibrator(blend_weight=0.5)
+            calibrator.fit(all_dws, target, target_dws_col,
+                           exclude_dates=exclude_dates)
 
         performance_report[target] = {
             'R2': r2, 'RMSE': rmse,
             'model': final,
             'features': all_feats,
             'log_transform': use_log,
+            'target_transformer': target_tf,
             'global_mean': float(y.mean()),
+            'calibrator': calibrator,
         }
 
         safe = target.replace(' ', '_')
@@ -911,27 +2272,6 @@ def train_models(df, log_transform=None, use_optuna=True, dws_context=None):
         print(f"   Saved model_{safe}.joblib")
 
     joblib.dump(knn_enc, "knn_encoder.joblib")
-    if xt_featurizer is not None:
-        joblib.dump(xt_featurizer, "cross_target_featurizer.joblib")
-        print("   Saved cross_target_featurizer.joblib")
-
-    sarimax_fitted = None
-    if HAS_SARIMAX and dws_context is not None:
-        all_dws = dws_context.get('all_dws')
-        if all_dws and len(all_dws) > 0:
-            try:
-                sarimax_fitted = StationSARIMAX(
-                    config.TARGETS, n_optuna_trials=20)
-                sarimax_fitted.fit(all_dws)
-                sarimax_cv = sarimax_fitted.evaluate_cv(all_dws)
-                joblib.dump(sarimax_fitted, "sarimax_models.joblib")
-                print("   Saved sarimax_models.joblib")
-            except Exception as e:
-                print(f"   Warning: SARIMAX fitting failed (non-fatal): {e}")
-                traceback.print_exc()
-                sarimax_fitted = None
-
-    performance_report['_sarimax'] = sarimax_fitted
 
     print(f"\n{'='*65}")
     print("   FINAL CV RESULTS")
@@ -939,11 +2279,820 @@ def train_models(df, log_transform=None, use_optuna=True, dws_context=None):
     for t in config.TARGETS:
         if t in performance_report:
             m = performance_report[t]
-            sarimax_tag = ""
-            if sarimax_fitted is not None and hasattr(sarimax_fitted, 'models_'):
-                n_sarimax = sum(1 for k in sarimax_fitted.models_ if k[1] == t)
-                sarimax_tag = f"  SARIMAX={n_sarimax}stn"
-            print(f"   {t:>35s}:  R2={m['R2']:.3f}  RMSE={m['RMSE']:.1f}  "
-                  f"log={m['log_transform']}{sarimax_tag}")
+            print(f"   {t:>35s}:  R²={m['R2']:.3f}  RMSE={m['RMSE']:.1f}  "
+                  f"log={m['log_transform']}")
 
     return performance_report
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+def _merge_enrichment_to_dws(dws_df, enriched_df):
+    """
+    Merge satellite/terrain/weather features from enriched competition
+    data to DWS rows via nearest-location matching (IDW from 3 nearest).
+
+    Season-aware: uses per-season medians (DJF/MAM/JJA/SON) when DWS row
+    has date info, falls back to all-time median otherwise.
+    """
+    enr_cols = [c for c in enriched_df.columns
+                if c not in config.TARGETS + ['Sample Date', 'Latitude', 'Longitude']
+                and pd.api.types.is_numeric_dtype(enriched_df[c])]
+
+    if not enr_cols:
+        print("   No enrichment features to merge.")
+        return dws_df
+
+    enriched_df = enriched_df.copy()
+    loc_key = (enriched_df['Latitude'].round(4).astype(str) + '_' +
+               enriched_df['Longitude'].round(4).astype(str))
+    enriched_df['_loc'] = loc_key
+
+    # All-time per-location medians (fallback)
+    loc_medians = enriched_df.groupby('_loc')[enr_cols].median()
+
+    # Season-aware per-location medians
+    has_season = False
+    if 'Sample Date' in enriched_df.columns:
+        try:
+            enr_dates = pd.to_datetime(
+                enriched_df['Sample Date'], format='mixed', dayfirst=True)
+            enr_month = enr_dates.dt.month
+            enriched_df['_season'] = enr_month.map(
+                {12: 'DJF', 1: 'DJF', 2: 'DJF',
+                 3: 'MAM', 4: 'MAM', 5: 'MAM',
+                 6: 'JJA', 7: 'JJA', 8: 'JJA',
+                 9: 'SON', 10: 'SON', 11: 'SON'})
+            loc_season_medians = enriched_df.groupby(
+                ['_loc', '_season'])[enr_cols].median()
+            has_season = True
+            print("   Using season-aware enrichment merge")
+        except Exception:
+            has_season = False
+
+    # DWS season if available
+    dws_season = None
+    if has_season:
+        dws_date_col = None
+        if 'date' in dws_df.columns:
+            dws_date_col = 'date'
+        elif 'Sample Date' in dws_df.columns:
+            dws_date_col = 'Sample Date'
+        if dws_date_col is not None:
+            try:
+                dws_dates = pd.to_datetime(
+                    dws_df[dws_date_col], format='mixed', dayfirst=True)
+                dws_month = dws_dates.dt.month
+                dws_season = dws_month.map(
+                    {12: 'DJF', 1: 'DJF', 2: 'DJF',
+                     3: 'MAM', 4: 'MAM', 5: 'MAM',
+                     6: 'JJA', 7: 'JJA', 8: 'JJA',
+                     9: 'SON', 10: 'SON', 11: 'SON'})
+            except Exception:
+                dws_season = None
+
+    # Build location tree
+    comp_locs = enriched_df[['Latitude', 'Longitude']].drop_duplicates().values
+    comp_loc_keys = (pd.Series(comp_locs[:, 0]).round(4).astype(str) + '_' +
+                     pd.Series(comp_locs[:, 1]).round(4).astype(str)).values
+
+    if len(comp_locs) == 0:
+        return dws_df
+
+    from sklearn.neighbors import BallTree as BT
+    tree = BT(np.deg2rad(comp_locs), metric='haversine')
+
+    for f in enr_cols:
+        dws_df[f] = np.nan
+
+    dws_loc_key = (dws_df['Latitude'].round(4).astype(str) + '_' +
+                   dws_df['Longitude'].round(4).astype(str))
+
+    # Missingness indicators for enrichment
+    dws_df['_has_enrichment'] = 0
+    dws_df['_enrichment_dist_km'] = np.nan
+
+    # For efficiency, work per-(location, season) group
+    if has_season and dws_season is not None:
+        dws_df['_tmp_loc'] = dws_loc_key
+        dws_df['_tmp_season'] = dws_season
+        unique_groups = dws_df.groupby(['_tmp_loc', '_tmp_season']).groups
+    else:
+        dws_df['_tmp_loc'] = dws_loc_key
+        unique_groups = {(loc, None): idx
+                         for loc, idx in dws_df.groupby('_tmp_loc').groups.items()}
+
+    filled = 0
+    for (uloc, season), row_idx in unique_groups.items():
+        mask = dws_df.index.isin(row_idx)
+        lat = dws_df.loc[mask, 'Latitude'].iloc[0]
+        lon = dws_df.loc[mask, 'Longitude'].iloc[0]
+
+        k = min(3, len(comp_locs))
+        dists, inds = tree.query(np.deg2rad([[lat, lon]]), k=k)
+        dists_km = dists[0] * 6371.0
+        weights = 1.0 / (dists_km + 1.0)
+        weights /= weights.sum()
+
+        any_filled = False
+        for f in enr_cols:
+            vals, ws = [], []
+            for j, idx in enumerate(inds[0]):
+                lk = comp_loc_keys[idx]
+                v = None
+                # Try season-specific median first
+                if has_season and season is not None:
+                    try:
+                        v = loc_season_medians.at[(lk, season), f]
+                    except (KeyError, TypeError):
+                        v = None
+                # Fall back to all-time median
+                if v is None or pd.isna(v):
+                    if lk in loc_medians.index:
+                        v = loc_medians.at[lk, f]
+                if pd.notna(v):
+                    vals.append(v)
+                    ws.append(weights[j])
+            if vals:
+                dws_df.loc[mask, f] = np.average(vals, weights=ws)
+                any_filled = True
+        if any_filled:
+            dws_df.loc[mask, '_has_enrichment'] = 1
+            dws_df.loc[mask, '_enrichment_dist_km'] = float(dists_km[0])
+        filled += 1
+
+    # Clean up temp columns
+    dws_df.drop(columns=['_tmp_loc'], inplace=True, errors='ignore')
+    dws_df.drop(columns=['_tmp_season'], inplace=True, errors='ignore')
+
+    print(f"   Merged enrichment features: {len(enr_cols)} features "
+          f"for {filled} DWS location-season groups")
+    return dws_df
+
+
+def _prepare_competition_data(comp_df, all_dws, dws_df):
+    """
+    Prepare competition training data to be combined with DWS data.
+    Add DWS aux features to competition rows where possible.
+    """
+    import dws_data as dws_mod
+
+    comp = comp_df.copy()
+    comp = engineer_features(comp)
+    comp['_station'] = comp.apply(
+        lambda r: dws_mod.coord_to_station(r['Latitude'], r['Longitude']),
+        axis=1)
+
+    # Source indicator
+    comp['_is_dws'] = 0
+    comp['_has_enrichment'] = 1   # competition data IS the enrichment source
+    comp['_enrichment_dist_km'] = 0.0
+
+    # Parse dates
+    if 'date' not in comp.columns or comp['date'].dtype == object:
+        if 'Sample Date' in comp.columns:
+            comp['date'] = pd.to_datetime(comp['Sample Date'], dayfirst=True)
+
+    # Add DWS aux features where stations match
+    comp = dws_mod.add_sameday_aux_features(comp, all_dws)
+
+    # Missingness indicator: does this comp row have DWS aux data?
+    dws_aux_cols = [c for c in comp.columns if c.startswith('dws_aux_')]
+    if dws_aux_cols:
+        comp['_has_dws_aux'] = comp[dws_aux_cols].notna().any(axis=1).astype(int)
+    else:
+        comp['_has_dws_aux'] = 0
+
+    # Add lag features
+    comp = dws_mod.add_lag_features(comp, all_dws, config.TARGETS)
+
+    # Missingness indicator: does this comp row have DWS lag data?
+    lag_cols = [c for c in comp.columns if c.startswith('lag_') or c.startswith('roll')]
+    if lag_cols:
+        comp['_has_dws_lag'] = comp[lag_cols].notna().any(axis=1).astype(int)
+    else:
+        comp['_has_dws_lag'] = 0
+
+    # Add station historical features
+    comp = add_station_historical_features(comp, all_dws)
+
+    # Add time-weighted station features
+    comp = add_time_weighted_station_features(comp, all_dws, halflife_days=730)
+
+    # Add neighbor/upstream features
+    comp = dws_mod.build_neighbor_features(comp, all_dws)
+
+    # Missingness indicator: does this comp row have station history?
+    stn_cols = [c for c in comp.columns if c.startswith('stn_')]
+    if stn_cols:
+        comp['_has_stn_hist'] = comp[stn_cols].notna().any(axis=1).astype(int)
+    else:
+        comp['_has_stn_hist'] = 0
+
+    # Drop helper columns
+    comp.drop(columns=['date', 'station', '_dws_station'],
+              errors='ignore', inplace=True)
+
+    # Ensure same columns exist (fill missing cols with NaN, not 0)
+    dws_cols = set(dws_df.columns)
+    for c in dws_cols:
+        if c not in comp.columns and c not in config.TARGETS:
+            comp[c] = np.nan
+
+    return comp
+
+
+def _train_models_basic(df, log_transform, use_optuna):
+    """Fallback: basic training without DWS context."""
+    print("   Basic mode (no DWS data available)")
+    df = engineer_features(df)
+
+    knn_enc = SpatialKNNEncoder(config.TARGETS, k_values=(5, 10))
+    knn_enc.fit(df)
+
+    always_drop = ['Sample Date', '_station', 'Latitude', 'Longitude',
+                   'date', 'station', 'key']
+    drop_cols = config.TARGETS + always_drop
+    base_features = [c for c in df.columns
+                     if c not in drop_cols
+                     and pd.api.types.is_numeric_dtype(df[c])]
+
+    performance_report = {
+        '_knn_encoder': knn_enc,
+        '_xt_featurizer': None,
+        '_base_features': base_features,
+        '_dws_context': None,
+        '_sarimax': None,
+    }
+
+    for target in config.TARGETS:
+        if target not in df.columns:
+            continue
+
+        estimators, use_log_auto = _get_models_for_target(target)
+        use_log = use_log_auto if log_transform is None else log_transform
+
+        tdf = df.dropna(subset=[target]).copy()
+        groups = (tdf['Latitude'].round(2).astype(str) + "_" +
+                  tdf['Longitude'].round(2).astype(str))
+        y = tdf[target].clip(lower=tdf[target].quantile(0.01),
+                             upper=tdf[target].quantile(0.99))
+
+        tdf_knn = knn_enc.transform(tdf, is_train=True)
+        all_feats = [f for f in tdf_knn.columns
+                     if (f in base_features or '_knn' in f or '_nn_dist' in f)
+                     and f not in config.TARGETS]
+        all_feats = list(dict.fromkeys(all_feats))
+
+        y_fit = np.log1p(np.clip(y, 0, None)) if use_log else y.values
+        final = StackingEnsemble(estimators, n_folds=5)
+        X_basic = np.array(tdf_knn[all_feats], dtype=np.float64)
+        X_basic = np.where(np.isinf(X_basic), 0.0, X_basic)
+        final.fit(
+            X_basic,
+            np.array(y_fit, dtype=np.float64),
+            groups=np.array(groups))
+
+        performance_report[target] = {
+            'R2': 0.0, 'RMSE': 999.0,
+            'model': final,
+            'features': all_feats,
+            'log_transform': use_log,
+            'global_mean': float(y.mean()),
+        }
+
+    return performance_report
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 8.  PER-STATION DIRECT PREDICTION  (v8 – PRIMARY PREDICTOR)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# v8 change from v7: per-station prediction is now the PRIMARY predictor,
+# not a secondary refinement.  The global ensemble serves as a fallback.
+#
+# Architecture:
+#   A) ElasticNetCV from same-day auxiliary chemistry → target
+#      (with polynomial features for key interactions)
+#   B) Per-station GradientBoosting (for stations with ≥50 samples)
+#   C) Temporal interpolation from k nearest measurements in time
+#   D) Confidence-weighted blend of A, B, C
+#
+# Why this dominates the global model:
+#  • Same-day Na/DMS have ρ ≈ 0.99 with EC at any given station
+#  • pH/Ca/Mg → TAL with ρ ≈ 0.8+
+#  • P_Tot → DRP with ρ ≈ 0.67
+#  • No spatial generalisation needed — every test station is known
+#  • Per-station models avoid variance compression from global averaging
+# ─────────────────────────────────────────────────────────────────────────────
+
+_PS_AUX_COLS = [
+    'pH_Diss_Water', 'Ca_Diss_Water', 'Mg_Diss_Water',
+    'Na_Diss_Water', 'Cl_Diss_Water', 'SO4_Diss_Water',
+    'F_Diss_Water', 'Si_Diss_Water', 'K_Diss_Water',
+    'NH4_N_Diss_Water', 'NO3_NO2_N_Diss_Water',
+    'DMS_Tot_Water', 'P_Tot_Water',
+]
+
+# Target-specific priority features for per-station regression
+_PS_PRIORITY_FEATURES = {
+    'Electrical Conductance': [
+        'Na_Diss_Water', 'DMS_Tot_Water', 'Mg_Diss_Water',
+        'Cl_Diss_Water', 'SO4_Diss_Water', 'Ca_Diss_Water',
+        'K_Diss_Water', 'Si_Diss_Water',
+    ],
+    'Total Alkalinity': [
+        'pH_Diss_Water', 'Ca_Diss_Water', 'Mg_Diss_Water',
+        'DMS_Tot_Water', 'F_Diss_Water', 'Na_Diss_Water',
+    ],
+    'Dissolved Reactive Phosphorus': [
+        'P_Tot_Water', 'NH4_N_Diss_Water', 'NO3_NO2_N_Diss_Water',
+        'pH_Diss_Water', 'Si_Diss_Water', 'F_Diss_Water',
+    ],
+}
+
+
+def _ps_temporal_interpolation(sdf, dws_col, target_date, k=7):
+    """
+    Predict target value from k nearest temporal neighbours using
+    inverse-distance weighting in time.  Excludes the exact test date.
+
+    Returns (prediction, confidence).
+    """
+    valid = sdf.copy()
+    valid[dws_col] = pd.to_numeric(valid[dws_col], errors='coerce')
+    valid = valid[(valid['date'].dt.date != target_date.date()) &
+                  (valid[dws_col].notna())].sort_values('date')
+
+    if len(valid) == 0:
+        return None, 0.0
+
+    vals = valid[dws_col].values.astype(np.float64)
+    days_diff = np.abs(
+        (valid['date'] - target_date).dt.total_seconds().values / 86400)
+
+    k_actual = min(k, len(valid))
+    idx = np.argpartition(days_diff, k_actual)[:k_actual]
+
+    nearest_vals = vals[idx]
+    nearest_days = days_diff[idx]
+
+    weights = 1.0 / (nearest_days + 1.0)
+    weights /= weights.sum()
+
+    pred = float(np.average(nearest_vals, weights=weights))
+
+    min_gap = nearest_days.min()
+    if min_gap <= 7:
+        conf = 0.95
+    elif min_gap <= 30:
+        conf = 0.85
+    elif min_gap <= 90:
+        conf = 0.60
+    elif min_gap <= 180:
+        conf = 0.35
+    else:
+        conf = 0.15
+
+    return pred, conf
+
+
+def _ps_regression(sdf, dws_col, target_date, aux_values, target_name=None):
+    """
+    Per-station ElasticNetCV regression: aux_chemistry + month → target.
+    Trained on all data at this station EXCEPT the test date.
+    Uses polynomial features for key interactions.
+
+    Returns (prediction, confidence, model_r2).
+    """
+    train = sdf[sdf['date'].dt.date != target_date.date()].copy()
+    train[dws_col] = pd.to_numeric(train[dws_col], errors='coerce')
+    train = train[train[dws_col].notna()].copy()
+
+    if len(train) < 5:
+        return None, 0.0, 0.0
+
+    # Select aux columns with enough coverage at this station
+    # Prioritise target-specific features
+    priority = _PS_PRIORITY_FEATURES.get(target_name, []) if target_name else []
+    available = [c for c in _PS_AUX_COLS if c in train.columns]
+    good_aux = []
+    for c in priority + [c for c in available if c not in priority]:
+        if c not in available:
+            continue
+        v = pd.to_numeric(train[c], errors='coerce')
+        if v.notna().sum() >= max(5, len(train) * 0.15):
+            good_aux.append(c)
+
+    if len(good_aux) < 1:
+        return None, 0.0, 0.0
+
+    for c in good_aux:
+        train[c] = pd.to_numeric(train[c], errors='coerce')
+
+    # Seasonal features
+    month = train['date'].dt.month
+    train['_m_sin'] = np.sin(2 * np.pi * month / 12)
+    train['_m_cos'] = np.cos(2 * np.pi * month / 12)
+    train['_year_frac'] = (train['date'].dt.year +
+                           train['date'].dt.dayofyear / 365.25)
+
+    feature_cols = good_aux + ['_m_sin', '_m_cos', '_year_frac']
+    subset = train.dropna(subset=good_aux).copy()
+
+    if len(subset) < 5:
+        return None, 0.0, 0.0
+
+    X_train = subset[feature_cols].values.astype(np.float64)
+    y_train = subset[dws_col].values.astype(np.float64)
+
+    # Build test vector
+    x_test = []
+    for c in good_aux:
+        v = aux_values.get(c, np.nan)
+        if np.isnan(v):
+            v = float(subset[c].median())
+        x_test.append(v)
+    x_test.append(np.sin(2 * np.pi * target_date.month / 12))
+    x_test.append(np.cos(2 * np.pi * target_date.month / 12))
+    x_test.append(target_date.year + target_date.timetuple().tm_yday / 365.25)
+    X_test = np.array([x_test], dtype=np.float64)
+
+    if np.any(np.isnan(X_test)):
+        return None, 0.0, 0.0
+
+    # Standardise
+    scaler = StandardScaler()
+    X_train_s = scaler.fit_transform(X_train)
+    X_test_s = scaler.transform(X_test)
+
+    # Add polynomial features for top chemistry pairs (degree 2)
+    # Only if enough samples to support the extra features
+    n_poly_feats = X_train_s.shape[1]
+    use_poly = len(subset) > 3 * (n_poly_feats * (n_poly_feats + 1) // 2)
+    if use_poly and len(good_aux) >= 2:
+        poly = PolynomialFeatures(degree=2, include_bias=False,
+                                  interaction_only=False)
+        X_train_s = poly.fit_transform(X_train_s)
+        X_test_s = poly.transform(X_test_s)
+
+    # ElasticNetCV with automatic regularisation + feature selection
+    try:
+        model = ElasticNetCV(
+            l1_ratio=[0.1, 0.3, 0.5, 0.7, 0.9, 0.95],
+            alphas=np.logspace(-4, 2, 30),
+            cv=min(5, len(subset)),
+            max_iter=5000,
+            random_state=42,
+        )
+        model.fit(X_train_s, y_train)
+        pred = float(model.predict(X_test_s)[0])
+
+        # Confidence ≈ LOO-ish training R²
+        train_pred = model.predict(X_train_s)
+        r2 = max(0, r2_score(y_train, train_pred))
+
+    except Exception:
+        # Fallback to Ridge if ElasticNetCV fails
+        alpha = max(1.0, 300.0 / len(subset))
+        model = Ridge(alpha=alpha)
+        model.fit(X_train_s, y_train)
+        pred = float(model.predict(X_test_s)[0])
+        train_pred = model.predict(X_train_s)
+        r2 = max(0, r2_score(y_train, train_pred))
+
+    # Clip to station's historical range with margin
+    y_range = y_train.max() - y_train.min()
+    margin = y_range * 0.4  # slightly wider margin than v7
+    pred = np.clip(pred,
+                   max(0, y_train.min() - margin),
+                   y_train.max() + margin)
+
+    return pred, min(r2, 0.99), r2
+
+
+def _ps_gradient_boosting(sdf, dws_col, target_date, aux_values,
+                          target_name=None):
+    """
+    Per-station GradientBoosting for stations with rich history (≥30 samples).
+    More expressive than ElasticNet for nonlinear relationships.
+
+    Returns (prediction, confidence, model_r2).
+    """
+    train = sdf[sdf['date'].dt.date != target_date.date()].copy()
+    train[dws_col] = pd.to_numeric(train[dws_col], errors='coerce')
+    train = train[train[dws_col].notna()].copy()
+
+    if len(train) < 30:
+        return None, 0.0, 0.0
+
+    # Select aux columns
+    available = [c for c in _PS_AUX_COLS if c in train.columns]
+    good_aux = []
+    for c in available:
+        v = pd.to_numeric(train[c], errors='coerce')
+        if v.notna().sum() >= max(10, len(train) * 0.15):
+            good_aux.append(c)
+
+    if len(good_aux) < 2:
+        return None, 0.0, 0.0
+
+    for c in good_aux:
+        train[c] = pd.to_numeric(train[c], errors='coerce')
+
+    # Features
+    month = train['date'].dt.month
+    train['_m_sin'] = np.sin(2 * np.pi * month / 12)
+    train['_m_cos'] = np.cos(2 * np.pi * month / 12)
+    train['_year_frac'] = (train['date'].dt.year +
+                           train['date'].dt.dayofyear / 365.25)
+
+    feature_cols = good_aux + ['_m_sin', '_m_cos', '_year_frac']
+    subset = train.dropna(subset=good_aux).copy()
+
+    if len(subset) < 30:
+        return None, 0.0, 0.0
+
+    X_train = subset[feature_cols].values.astype(np.float64)
+    y_train = subset[dws_col].values.astype(np.float64)
+
+    # Build test vector
+    x_test = []
+    for c in good_aux:
+        v = aux_values.get(c, np.nan)
+        if np.isnan(v):
+            v = float(subset[c].median())
+        x_test.append(v)
+    x_test.append(np.sin(2 * np.pi * target_date.month / 12))
+    x_test.append(np.cos(2 * np.pi * target_date.month / 12))
+    x_test.append(target_date.year + target_date.timetuple().tm_yday / 365.25)
+    X_test = np.array([x_test], dtype=np.float64)
+
+    X_train = np.nan_to_num(X_train, nan=0.0)
+    X_test = np.nan_to_num(X_test, nan=0.0)
+
+    # Regularised GBR — conservative to prevent per-station overfitting
+    n_est = min(200, max(50, len(subset) // 2))
+    model = GradientBoostingRegressor(
+        n_estimators=n_est,
+        learning_rate=0.05,
+        max_depth=3,
+        min_samples_leaf=max(5, len(subset) // 20),
+        subsample=0.8,
+        random_state=42,
+    )
+
+    try:
+        model.fit(X_train, y_train)
+        pred = float(model.predict(X_test)[0])
+
+        # OOF-like R² estimate via last 20% temporal split
+        n_tr = int(0.8 * len(subset))
+        if n_tr >= 10:
+            dates_sorted = subset.sort_values('date').index
+            tr_idx = dates_sorted[:n_tr]
+            va_idx = dates_sorted[n_tr:]
+            X_va = subset.loc[va_idx, feature_cols].values.astype(np.float64)
+            X_va = np.nan_to_num(X_va, nan=0.0)
+            y_va = subset.loc[va_idx, dws_col].values.astype(np.float64)
+            X_tr_split = subset.loc[tr_idx, feature_cols].values.astype(np.float64)
+            X_tr_split = np.nan_to_num(X_tr_split, nan=0.0)
+            y_tr_split = subset.loc[tr_idx, dws_col].values.astype(np.float64)
+            m_split = GradientBoostingRegressor(
+                n_estimators=n_est, learning_rate=0.05, max_depth=3,
+                min_samples_leaf=max(5, len(subset) // 20),
+                subsample=0.8, random_state=42)
+            m_split.fit(X_tr_split, y_tr_split)
+            va_pred = m_split.predict(X_va)
+            r2 = max(0, r2_score(y_va, va_pred))
+        else:
+            train_pred = model.predict(X_train)
+            r2 = max(0, r2_score(y_train, train_pred)) * 0.7  # discount
+
+    except Exception:
+        return None, 0.0, 0.0
+
+    # Clip to station range
+    y_range = y_train.max() - y_train.min()
+    margin = y_range * 0.4
+    pred = np.clip(pred,
+                   max(0, y_train.min() - margin),
+                   y_train.max() + margin)
+
+    return pred, min(r2, 0.99), r2
+
+
+def per_station_predict(sub_df, all_dws):
+    """
+    Per-station direct prediction for all targets (v8 – PRIMARY).
+
+    For each test row at station S on date D:
+      1. Look up same-day auxiliary chemistry from DWS
+      2. Train per-station ElasticNetCV with polynomial features
+      3. Train per-station GradientBoosting (if ≥30 samples)
+      4. Compute temporal interpolation from nearest measurements
+      5. Confidence-weighted blend of all available predictions
+
+    Returns
+    -------
+    dict : {target_name: np.ndarray of predictions}
+    dict : {target_name: np.ndarray of confidence scores}
+    """
+    import dws_data as dws_mod
+
+    sub = sub_df.copy()
+    if 'date' not in sub.columns or sub['date'].dtype == object:
+        if 'Sample Date' in sub.columns:
+            sub['date'] = pd.to_datetime(sub['Sample Date'], dayfirst=True)
+
+    if '_station' not in sub.columns:
+        sub['_station'] = sub.apply(
+            lambda r: dws_mod.coord_to_station(
+                r['Latitude'], r['Longitude']),
+            axis=1)
+
+    results = {}
+    confidences = {}
+
+    for target in config.TARGETS:
+        dws_col = dws_mod._COL_FOR_TARGET.get(target)
+        if dws_col is None:
+            continue
+
+        print(f"      {target}:")
+        preds = np.full(len(sub), np.nan)
+        confs = np.full(len(sub), 0.0)
+        n_reg, n_gb, n_interp, n_miss = 0, 0, 0, 0
+        reg_r2s, gb_r2s = [], []
+
+        for pos in range(len(sub)):
+            row = sub.iloc[pos]
+            station = row.get('_station')
+            date = row['date']
+
+            if pd.isna(station) or station not in all_dws:
+                n_miss += 1
+                continue
+
+            sdf = all_dws[station]
+
+            # Same-day auxiliary chemistry
+            same_day = sdf[sdf['date'].dt.date == date.date()]
+            aux_vals = {}
+            if len(same_day) > 0:
+                for c in _PS_AUX_COLS:
+                    if c in same_day.columns:
+                        v = pd.to_numeric(
+                            same_day.iloc[0].get(c), errors='coerce')
+                        if pd.notna(v):
+                            aux_vals[c] = float(v)
+
+            # Method A: Per-station ElasticNet regression
+            pred_reg, conf_reg, r2_reg = _ps_regression(
+                sdf, dws_col, date, aux_vals, target_name=target)
+            if pred_reg is not None:
+                n_reg += 1
+                reg_r2s.append(r2_reg)
+
+            # Method B: Per-station GradientBoosting
+            pred_gb, conf_gb, r2_gb = _ps_gradient_boosting(
+                sdf, dws_col, date, aux_vals, target_name=target)
+            if pred_gb is not None:
+                n_gb += 1
+                gb_r2s.append(r2_gb)
+
+            # Method C: Temporal interpolation
+            pred_interp, conf_interp = _ps_temporal_interpolation(
+                sdf, dws_col, date, k=10)
+            if pred_interp is not None:
+                n_interp += 1
+
+            # Confidence-weighted blend of all available predictions
+            candidates = []
+            if pred_reg is not None:
+                candidates.append((pred_reg, conf_reg))
+            if pred_gb is not None:
+                candidates.append((pred_gb, conf_gb))
+            if pred_interp is not None:
+                # Slightly downweight temporal interpolation vs regression
+                candidates.append((pred_interp, conf_interp * 0.7))
+
+            if candidates:
+                total_conf = sum(c for _, c in candidates)
+                if total_conf > 0:
+                    blended = sum(p * c for p, c in candidates) / total_conf
+                    preds[pos] = blended
+                    confs[pos] = total_conf / len(candidates)
+                else:
+                    preds[pos] = np.mean([p for p, _ in candidates])
+                    confs[pos] = 0.1
+            else:
+                n_miss += 1
+
+        # Fill remaining NaN with station historical median
+        for pos in range(len(sub)):
+            if np.isnan(preds[pos]):
+                station = sub.iloc[pos].get('_station')
+                if pd.notna(station) and station in all_dws:
+                    vals = pd.to_numeric(
+                        all_dws[station].get(
+                            dws_col, pd.Series(dtype=float)),
+                        errors='coerce').dropna()
+                    if len(vals) > 0:
+                        preds[pos] = float(vals.median())
+                        confs[pos] = 0.2  # low confidence for median fallback
+
+        preds = np.clip(np.nan_to_num(preds, nan=0), 0, None)
+        results[target] = preds
+        confidences[target] = confs
+
+        avg_reg_r2 = np.mean(reg_r2s) if reg_r2s else 0
+        avg_gb_r2 = np.mean(gb_r2s) if gb_r2s else 0
+        print(f"         reg={n_reg} (mean R²={avg_reg_r2:.3f})  "
+              f"gb={n_gb} (mean R²={avg_gb_r2:.3f})  "
+              f"interp={n_interp}  miss={n_miss}")
+        print(f"         mean={preds.mean():.2f}  std={preds.std():.2f}  "
+              f"min={preds.min():.2f}  max={preds.max():.2f}")
+        print(f"         conf: mean={confs.mean():.3f}  "
+              f"min={confs.min():.3f}  max={confs.max():.3f}")
+
+    return results, confidences
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9.  VARIANCE DECOMPRESSOR – fix global model prediction compression
+# ─────────────────────────────────────────────────────────────────────────────
+class VarianceDecompressor:
+    """
+    Post-prediction variance rescaling per station.
+
+    The global ensemble compresses predictions toward the mean, producing
+    pred_std << true_std.  This decompressor rescales each station's
+    predictions to match the historical distribution (mean + std matching).
+
+    For station S:
+      pred_rescaled = station_mean + (pred - pred_mean) * (station_std / pred_std)
+
+    This is applied BEFORE blending with per-station predictions.
+    """
+
+    def __init__(self):
+        self.station_stats_ = {}  # {station: (mean, std)}
+        self.global_mean_ = 0.0
+        self.global_std_ = 1.0
+
+    def fit(self, all_dws, dws_col, exclude_dates=None):
+        """Compute per-station target distribution stats."""
+        if exclude_dates is None:
+            exclude_dates = {}
+
+        all_vals = []
+        for stn, sdf in all_dws.items():
+            vals = pd.to_numeric(sdf.get(dws_col, pd.Series(dtype=float)),
+                                 errors='coerce')
+            if stn in exclude_dates:
+                keep = ~sdf['date'].dt.date.isin(exclude_dates[stn])
+                vals = vals[keep]
+            vals = vals.dropna()
+            if len(vals) >= 5:
+                self.station_stats_[stn] = (float(vals.mean()),
+                                            float(vals.std()))
+                all_vals.extend(vals.values)
+
+        if all_vals:
+            self.global_mean_ = float(np.mean(all_vals))
+            self.global_std_ = max(float(np.std(all_vals)), 1e-8)
+        return self
+
+    def decompress(self, preds, stations):
+        """
+        Rescale predictions per station to match historical variance.
+
+        preds: array of predictions
+        stations: array of station codes
+        Returns: rescaled predictions
+        """
+        result = preds.copy()
+        for stn in set(stations):
+            if pd.isna(stn) or stn not in self.station_stats_:
+                continue
+            mask = np.array([s == stn for s in stations])
+            if mask.sum() == 0:
+                continue
+
+            stn_mean, stn_std = self.station_stats_[stn]
+            if stn_std < 1e-8:
+                stn_std = self.global_std_
+
+            stn_preds = preds[mask]
+            pred_mean = stn_preds.mean()
+            pred_std = max(stn_preds.std(), 1e-8)
+
+            # Rescale to match station distribution
+            scale = stn_std / pred_std
+            # Cap the scale factor to avoid extreme amplification
+            scale = min(scale, 5.0)
+            result[mask] = stn_mean + (stn_preds - pred_mean) * scale
+
+        return np.clip(result, 0, None)
