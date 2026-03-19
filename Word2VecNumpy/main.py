@@ -27,6 +27,7 @@ from data import (
     subsample,
 )
 from evaluate import nearest_neighbours, word_analogies
+from evaluate import DEFAULT_ANALOGIES, DEFAULT_QUERIES
 from model import SkipGramNS
 from train import train
 
@@ -48,6 +49,16 @@ def main() -> None:
     print(" STEP 2 / 5 - Building vocabulary")
     print("=" * 60)
     vocab = build_vocab(tokens)
+
+    eval_words = set(DEFAULT_QUERIES)
+    for a, b, c, d in DEFAULT_ANALOGIES:
+        eval_words.update((a, b, c, d))
+    missing_eval_words = sorted(w for w in eval_words if w not in vocab)
+    if missing_eval_words:
+        print(
+            f"[main] Warning: {len(missing_eval_words)} eval words are OOV "
+            f"after MIN_COUNT filtering: {missing_eval_words}"
+        )
 
     # Convert corpus to integer IDs, discarding OOV words
     corpus_ids = np.array(
