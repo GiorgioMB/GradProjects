@@ -2,27 +2,27 @@
 config.py - Every parameter lives here.
 """
 
-EMBED_DIM: int = 100
+EMBED_DIM: int = 200
 
 MAX_VOCAB_SIZE: int = 20_000
 """Keep only the top-N most frequent words."""
 
-MIN_COUNT: int = 5
+MIN_COUNT: int = 12
 """Discard words that appear fewer than this many times in the corpus."""
 
-SUBSAMPLE_THRESH: float = 1e-3
+SUBSAMPLE_THRESH: float = 5e-4
 """Subsampling threshold t, following Mikolov et al. (2013), 
 each word w with frequency f(w) is kept with probability 
 P(w) = \min(\max(0, 1 - \sqrt(\frac{t}{f(w)})), 1)"""
 
-WINDOW_SIZE: int = 5
+WINDOW_SIZE: int = 6
 """Maximum context window on each side.  For each training example the
 actual window is sampled uniformly from [1, WINDOW_SIZE]."""
 
-NUM_NEGATIVES: int = 5
+NUM_NEGATIVES: int = 10
 """Number of negative samples drawn per (center, context) positive pair."""
 
-EPOCHS: int = 10
+EPOCHS: int = 20
 """Number of full passes through the corpus."""
 
 TOP_K_NEIGHBOURS: int = 25
@@ -39,7 +39,7 @@ Higher values make analogy scoring more forgiving because the expected
 answer can match anywhere within a larger top-k set.
 """
 
-LEARNING_RATE: float = 0.1
+LEARNING_RATE: float = 0.05
 """Initial learning rate for SGD."""
 
 MIN_LR: float = 1e-4
