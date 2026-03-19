@@ -6,7 +6,7 @@ Pipeline:
 load_corpus         -> Download / read WikiText-2 and tokenise.
 build_vocab         -> Frequency counts and word <--> id mappings.
 subsample           -> Probabilistically discard frequent words from the corpus.
-build_neg_table     -> Pre-compute a large table for {\cal O}(1) neg sampling.
+build_neg_table     -> Pre-compute a large table for O(1) neg sampling.
 generate_batches    -> Yield mini-batches of (center, context, negatives).
 """
 from __future__ import annotations
@@ -131,10 +131,15 @@ def build_vocab(
     min_count: int = config.MIN_COUNT,
 ) -> Vocabulary:
     counter = Counter(tokens)
-    # Filter by min_count and take the top-N
-    most_common = [
-        (w, c) for w, c in counter.most_common(max_vocab) if c >= min_count
-    ]
+    filtered = [(w, c) for w, c in counter.items() if c >= min_count]
+    filtered.sort(key=lambda item: item[1], reverse=True)
+    most_common = filtered[:max_vocab]
+
+    if not most_common:
+        raise ValueError(
+            "Vocabulary is empty after filtering. Lower MIN_COUNT or increase corpus size."
+        )
+
     word2id: dict[str, int] = {}
     id2word: dict[int, str] = {}
     counts_list: list[int] = []
@@ -146,7 +151,19 @@ def build_vocab(
 
     counts = np.array(counts_list, dtype=np.float64)
     vocab = Vocabulary(word2id, id2word, counts)
-    print(f"[data] Vocabulary built: {len(vocab):,} words")
+    kept_tokens = int(counts.sum())
+    total_tokens = len(tokens)
+    unique_types = len(counter)
+    print(
+        f"[data] Vocabulary built: {len(vocab):,} words "
+        f"(MIN_COUNT={min_count}, MAX_VOCAB_SIZE={max_vocab})"
+    )
+    print(
+        f"[data] Vocab coverage: tokens {kept_tokens:,}/{total_tokens:,} "
+        f"({100.0 * kept_tokens / max(total_tokens, 1):.1f}%), "
+        f"types {len(vocab):,}/{unique_types:,} "
+        f"({100.0 * len(vocab) / max(unique_types, 1):.1f}%)"
+    )
     return vocab
 
 def subsample(
