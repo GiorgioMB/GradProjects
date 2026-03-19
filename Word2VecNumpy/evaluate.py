@@ -103,6 +103,7 @@ DEFAULT_ANALOGIES = [
     ("good", "best", "bad", "worst"),
 ]
 
+
 def word_analogies(
     embeddings: np.ndarray,
     vocab: Vocabulary,
@@ -132,7 +133,7 @@ def word_analogies(
     normed = _normalise_rows(embeddings)
 
     print("=" * 60)
-    print(" WORD ANALOGIES  (A - B + C ≈ ?)")
+    print(" WORD ANALOGIES  (B - A + C ≈ ?)")
     print("=" * 60)
 
     hits = 0
