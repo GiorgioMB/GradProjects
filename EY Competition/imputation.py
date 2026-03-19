@@ -96,13 +96,48 @@ def diagnose_and_impute(df, fit_imputer=True, imputer_path="imputer_state.joblib
     else:
         medians = state['medians']
 
+    # 1. Drop columns that are entirely or almost entirely NaN (>95%)
+    #    These are dead features that just get filled with a constant anyway
+    num_cols = df.select_dtypes(include=[np.number]).columns
+    for c in num_cols:
+        frac_missing = df[c].isna().sum() / len(df)
+        if frac_missing > 0.95:
+            print(f"   Dropping '{c}' ({frac_missing*100:.0f}% NaN — too sparse)")
+            df = df.drop(columns=[c], errors='ignore')
+
+    # 2. For remaining NaNs, use location-group median first (same lat/lon),
+    #    then fall back to global median
+    loc_key = None
+    if 'Latitude' in df.columns and 'Longitude' in df.columns:
+        loc_key = (df['Latitude'].round(2).astype(str) + '_' +
+                   df['Longitude'].round(2).astype(str))
+
     for c in df.select_dtypes(include=[np.number]).columns:
         n = df[c].isna().sum()
         if n > 0:
-            fill_val = medians.get(c, df[c].median())
-            if pd.isna(fill_val):
-                fill_val = 0.0
-            print(f"   Filling {n} NaNs in '{c}' with {fill_val:.4f}")
-            df[c] = df[c].fillna(fill_val)
+            # Try location-group median first
+            filled_by_loc = 0
+            if loc_key is not None and n < len(df):  # skip if ALL are NaN
+                loc_medians = df.groupby(loc_key)[c].transform('median')
+                was_na = df[c].isna()
+                df[c] = df[c].fillna(loc_medians)
+                filled_by_loc = was_na.sum() - df[c].isna().sum()
+
+            # Fall back to global median for any remaining
+            n_remaining = df[c].isna().sum()
+            if n_remaining > 0:
+                fill_val = medians.get(c, df[c].median())
+                if pd.isna(fill_val):
+                    fill_val = 0.0
+                df[c] = df[c].fillna(fill_val)
+                if filled_by_loc > 0:
+                    print(f"   Filling {n} NaNs in '{c}': "
+                          f"{filled_by_loc} by location, "
+                          f"{n_remaining} by global median ({fill_val:.4f})")
+                else:
+                    print(f"   Filling {n} NaNs in '{c}' with {fill_val:.4f}")
+            elif filled_by_loc > 0:
+                print(f"   Filling {n} NaNs in '{c}': "
+                      f"all {filled_by_loc} by location median")
 
     return df
