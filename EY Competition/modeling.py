@@ -1,32 +1,3 @@
-"""
-modeling.py  –  Water-quality prediction modelling (v6 – DWS-CENTRIC)
-
-Key insight:  ALL 24 test locations are DWS monitoring stations with
-rich historical chemistry data.  Zero training locations overlap with
-test locations (nearest is 89+ km away).
-
-Architecture change from v5:
-──────────────────────────────────────────────────────────────────────
- •  PRIMARY training data = DWS measurements at all 24 test-location
-    stations (16K+ rows of water chemistry).  This gives the model
-    direct experience with every test location.
- •  PRIMARY features = same-day auxiliary DWS chemistry (pH, Ca, Mg,
-    Na, Cl, SO4, Si, NH4, NO3, F, K, DMS) + lag features + station
-    historical statistics + seasonal signals.
- •  SECONDARY features = satellite, terrain, weather, land cover
-    (available for both DWS rows and competition rows).
- •  Competition training data (9K rows at 162 non-test locations) is
-    used to add diversity and improve generalisation, NOT as the
-    primary signal.
- •  Leave-station-out CV (GroupKFold on station) to simulate test.
- •  Weighted ensemble: XGBoost, LightGBM, CatBoost, ExtraTrees, Ridge.
-
-DWS aux → target correlations (Spearman ρ):
-  EC  ← Na (0.99), DMS (0.99), Mg (0.98), Cl (0.92), SO4 (0.91)
-  TAL ← F (0.80), DMS (0.76), Mg (0.76), Ca (0.76), pH (0.63)
-  DRP ← P_Tot (0.67), NO3 (0.37), F (0.33), Si (0.31)
-"""
-
 import numpy as np
 import os
 import pandas as pd
