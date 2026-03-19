@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 warnings.filterwarnings("ignore")
 
 
-# STATION REGISTRY: 198 DWS stations (23 test + 175 training locations)
+# STATION REGISTRY: 24 test-location DWS stations
 # Format:  station_code -> (lat, lon, zip_url, csv_name_inside_zip)
 STATION_REGISTRY = {
     "Q1H001": (-31.903056, 25.482222,
@@ -83,6 +83,9 @@ STATION_REGISTRY = {
     "M1H012": (-33.771111, 25.386667,
                "https://www.dws.gov.za/iwqs/wms/data/M10/M10_102370.zip",
                "M10_102370.csv"),
+    "T1H015": (-32.000556, 28.581667,
+               "https://www.dws.gov.za/iwqs/wms/data/T13/T13_189160.zip",
+               "T13_189160.csv"),
 }
 
 # DWS column name -> Competition target name
@@ -94,16 +97,22 @@ DWS_COL_MAP = {
 _COL_FOR_TARGET = {v: k for k, v in DWS_COL_MAP.items()}
 
 # UNIT CONVERSIONS
+# DWS raw units → competition units
+# TAL: mg/L CaCO3 in both → no conversion
+# EC:  mS/m in DWS → µS/cm in competition → ×10
+#      (training EC mean=485, DWS raw EC mean=64 → 485/64≈7.6 ≈ ×10)
+# PO4: mg/L in DWS → µg/L in competition → ×1000
 DWS_UNIT_CONVERSIONS = {
-    "TAL_Diss_Water": 1.0,      # mg/L → mg/L (no conversion)
-    "EC_Phys_Water": 10.0,      # mS/m → µS/cm
-    "PO4_P_Diss_Water": 1000.0, # mg/L → µg/L
+    "TAL_Diss_Water": 1.0,       # mg/L → mg/L (no conversion)
+    "EC_Phys_Water": 10.0,       # mS/m → µS/cm
+    "PO4_P_Diss_Water": 1000.0,  # mg/L → µg/L
 }
 
 # Additional DWS columns that may be useful as auxiliary features
 DWS_AUX_COLS = [
     "Ca_Diss_Water", "Cl_Diss_Water", "DMS_Tot_Water",
-    "F_Diss_Water", "K_Diss_Water", "Mg_Diss_Water",
+    "F_Diss_Water", "K_Diss_Water", "KJEL_N_Tot_Water",
+    "Mg_Diss_Water",
     "Na_Diss_Water", "NH4_N_Diss_Water", "NO3_NO2_N_Diss_Water",
     "P_Tot_Water", "pH_Diss_Water", "Si_Diss_Water", "SO4_Diss_Water",
 ]
@@ -385,12 +394,15 @@ def coord_to_station(lat, lon, registry=None):
     return None
 
 
-# STATION-LEVEL FEATURES (Only uses data BEFORE cutoff_date to prevent leakage.)
+# STATION-LEVEL FEATURES
+# Per-row cutoff: uses all data strictly before each row's date.
+# For efficiency, precompute features at a few representative cutoff dates
+# and assign each row to the nearest preceding cutoff.
 def build_station_features(all_dws, cutoff_date=None):
     if cutoff_date is None:
-        cutoff_date = pd.Timestamp("2010-12-31")
+        cutoff_date = pd.Timestamp("2015-12-31")
 
-    print(f"   Building station features (data before "
+    print(f"   Building station features (data up to "
           f"{cutoff_date.strftime('%Y-%m-%d')}) ...")
 
     target_dws_cols = list(_COL_FOR_TARGET.values())
@@ -399,11 +411,7 @@ def build_station_features(all_dws, cutoff_date=None):
     for station, df in all_dws.items():
         hist = df[df["date"] <= cutoff_date].copy()
         if len(hist) < 3:
-            # Too little pre-cutoff data; include up to cutoff+buffer
-            # but log a warning
-            hist = df[df["date"] <= cutoff_date + pd.DateOffset(years=1)].copy()
-            if len(hist) < 3:
-                hist = df.copy()  # last resort — use everything
+            hist = df.copy()  # last resort — use everything
 
         feats = {}
 
@@ -539,7 +547,7 @@ def add_lag_features(df, all_dws, targets):
 
 
 # AUGMENT TRAINING DATA WITH DWS ROWS
-def build_augmented_rows(all_dws, test_df, date_range=("2011-01-01", "2015-12-31"),
+def build_augmented_rows(all_dws, test_df, date_range=("2000-01-01", "2015-12-31"),
                          train_df=None):
     print("   Building augmented DWS training rows ...")
 
@@ -875,3 +883,126 @@ def prepare_dws_augmentation(dws_dir, targets, test_df, train_df=None,
     aug_rows = build_augmented_rows(all_dws, test_df, train_df=train_df)
 
     return all_dws, station_features, aug_rows
+
+
+# ── NEIGHBOR / UPSTREAM FEATURES ────────────────────────────────────────
+# Stations in the same primary drainage region share the same river system.
+# We compute features from the nearest neighbor stations' recent data
+# to capture upstream / lateral influences on water quality.
+
+def _get_neighbor_stations(station, registry, max_neighbors=5, max_dist_deg=2.0):
+    """Find neighbor stations in the same primary drainage region."""
+    if station not in registry:
+        return []
+    primary = station[0]  # first letter = primary drainage region
+    slat, slon = registry[station][0], registry[station][1]
+    candidates = []
+    for s, (lat, lon, _, _) in registry.items():
+        if s == station or s[0] != primary:
+            continue
+        dist = np.sqrt((lat - slat)**2 + (lon - slon)**2)
+        if dist <= max_dist_deg:
+            candidates.append((s, dist))
+    candidates.sort(key=lambda x: x[1])
+    return candidates[:max_neighbors]
+
+
+def build_neighbor_features(df, all_dws, registry=None):
+    """
+    For each row, compute features from neighbor stations in the same
+    river system.  Uses the most recent measurement BEFORE the row's date
+    at each neighbor, then aggregates across neighbors (IDW-weighted).
+
+    Features: neighbor_{TAL,EC,DRP}_{mean,min,max}, neighbor_n_stations,
+              neighbor_mean_dist
+    """
+    if registry is None:
+        registry = _FULL_REGISTRY or STATION_REGISTRY
+
+    print("   Building neighbor/upstream features ...")
+
+    if "date" not in df.columns or df["date"].dtype == object:
+        if "Sample Date" in df.columns:
+            df["date"] = pd.to_datetime(df["Sample Date"], dayfirst=True)
+
+    if "_dws_station" not in df.columns:
+        df["_dws_station"] = df.apply(
+            lambda r: coord_to_station(r["Latitude"], r["Longitude"]),
+            axis=1,
+        )
+
+    target_dws_cols = list(_COL_FOR_TARGET.values())  # DWS column names
+    target_names = list(DWS_COL_MAP.values())          # competition names
+    prefixes = [t[:3].upper() for t in target_names]   # TAL, ELE, DIS
+
+    # Pre-compute neighbor lists
+    neighbor_cache = {}
+    for stn in registry:
+        neighbor_cache[stn] = _get_neighbor_stations(stn, registry)
+
+    # Output arrays
+    feat_names = []
+    for pfx in prefixes:
+        for agg in ["wmean", "wmin", "wmax"]:
+            feat_names.append(f"nbr_{pfx}_{agg}")
+    feat_names += ["nbr_n_stations", "nbr_mean_dist"]
+    out = {fn: np.full(len(df), np.nan) for fn in feat_names}
+
+    for i, (idx, row) in enumerate(df.iterrows()):
+        stn = row.get("_dws_station", None)
+        if stn is None or stn not in neighbor_cache:
+            continue
+        neighbors = neighbor_cache[stn]
+        if not neighbors:
+            continue
+
+        cur_date = row["date"]
+        if pd.isna(cur_date):
+            continue
+
+        # Gather target values from neighbors
+        nbr_vals = {pfx: [] for pfx in prefixes}
+        nbr_weights = []
+        nbr_dists = []
+
+        for nbr_stn, dist in neighbors:
+            if nbr_stn not in all_dws:
+                continue
+            ndf = all_dws[nbr_stn]
+            # Most recent measurement before current date
+            before = ndf[ndf["date"] < cur_date].sort_values("date")
+            if len(before) == 0:
+                continue
+            last = before.iloc[-1]
+            w = 1.0 / (dist + 0.01)  # IDW weight
+
+            has_any = False
+            for dws_col, pfx in zip(target_dws_cols, prefixes):
+                v = last.get(dws_col, np.nan)
+                if pd.notna(v):
+                    nbr_vals[pfx].append((float(v), w))
+                    has_any = True
+            if has_any:
+                nbr_weights.append(w)
+                nbr_dists.append(dist)
+
+        pos = df.index.get_loc(idx)
+        if nbr_dists:
+            out["nbr_n_stations"][pos] = len(nbr_dists)
+            out["nbr_mean_dist"][pos] = np.mean(nbr_dists)
+
+        for pfx in prefixes:
+            vals_w = nbr_vals[pfx]
+            if vals_w:
+                vs = [v for v, w in vals_w]
+                ws = [w for v, w in vals_w]
+                out[f"nbr_{pfx}_wmean"][pos] = np.average(vs, weights=ws)
+                out[f"nbr_{pfx}_wmin"][pos] = min(vs)
+                out[f"nbr_{pfx}_wmax"][pos] = max(vs)
+
+    for fn, arr in out.items():
+        df[fn] = arr
+    n_filled = df["nbr_n_stations"].notna().sum()
+    print(f"   Neighbor features: {len(feat_names)} features, "
+          f"{n_filled}/{len(df)} rows have data")
+    return df
