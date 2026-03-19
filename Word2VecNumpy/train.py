@@ -86,11 +86,11 @@ def train(
     SkipGramNS
         The trained model (same object, updated in-place).
     """
-        rng = np.random.default_rng(seed)
+    rng = np.random.default_rng(seed)
 
-    # Initial estimate for total steps (refined online after each epoch).
-    est_pairs_per_epoch = len(corpus_ids) * (window + 1)
-    estimated_total_steps = max((est_pairs_per_epoch * epochs) // batch_size, 1)
+    # Rough estimate of total steps for LR scheduling
+    est_pairs_per_epoch = len(corpus_ids) * window
+    total_steps = (est_pairs_per_epoch * epochs) // batch_size
 
     global_step = 0
     t0 = time.time()
@@ -112,7 +112,7 @@ def train(
         )
 
         for centers, contexts, negatives in batches:
-            progress = global_step / max(estimated_total_steps, 1)
+            progress = global_step / max(total_steps, 1)
             current_lr = _linear_lr(lr, min_lr, progress)
 
             batch_loss = model.train_step(
@@ -141,9 +141,6 @@ def train(
             f"avg loss {avg_epoch_loss:.4f}, "
             f"{elapsed:.0f}s total"
         )
-
-        observed_avg_steps = global_step / epoch
-        estimated_total_steps = max(int(observed_avg_steps * epochs), 1)
 
     save_embeddings(model, vocab)
 
