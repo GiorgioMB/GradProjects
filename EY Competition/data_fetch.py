@@ -19,7 +19,7 @@ def get_client():
     )
 
 
-# 1.  TERRAIN  (NASADEM via Planetary Computer)
+# TERRAIN  (NASADEM via Planetary Computer)
 def fetch_terrain_features(lat, lon, buffer_deg=0.01):
     try:
         catalog = get_client()
@@ -56,7 +56,7 @@ def fetch_terrain_features(lat, lon, buffer_deg=0.01):
         return {}
 
 
-# 2.  OSM context
+# OSM context
 def fetch_osm_context(lat, lon, dist_m=5000):
     tags = {
         'landuse': ['industrial', 'farmland', 'military',
@@ -86,7 +86,7 @@ def fetch_osm_context(lat, lon, dist_m=5000):
         return features
 
 
-# 3.  SATELLITE  (Landsat C2-L2)
+# SATELLITE  (Landsat C2-L2)
 def fetch_temporal_satellite(row, relaxed_mode=False):
     catalog   = get_client()
     window    = config.RETRY_WINDOW_DAYS if relaxed_mode else config.SAT_WINDOW_DAYS
@@ -160,7 +160,7 @@ def fetch_temporal_satellite(row, relaxed_mode=False):
             time.sleep(1 + attempt)
 
 
-# 4.  ORCHESTRATOR
+# MAIN
 def enrich_dataset(df, cache_path):
     df['key'] = (
         df['Latitude'].astype(str) + "_" +
@@ -169,7 +169,6 @@ def enrich_dataset(df, cache_path):
     )
     unique_rows = df.drop_duplicates(subset=['key'])
 
-    # PART A:  OSM + Terrain + Weather + Soil
     if os.path.exists(cache_path):
         print(f"   Loading cache '{cache_path}'...")
         # Robust read: truncate extra trailing fields to expected column count
@@ -191,12 +190,12 @@ def enrich_dataset(df, cache_path):
         )
         existing_keys = set(cached_df['key'])
 
-        # Check if cache is missing extended weather columns → rebuild those
+        # Check if cache is missing extended weather columns
         expected_weather = ['et_30d_sum', 'water_balance_30d', 'wind_30d_mean',
                             'humidity_30d_mean', 'radiation_30d_mean']
         missing_cols = [c for c in expected_weather if c not in cached_df.columns]
         if missing_cols:
-            print(f"   Cache is missing columns {missing_cols} – will re-fetch.")
+            print(f"   Cache is missing columns {missing_cols} - will re-fetch.")
             # Force re-fetch all cached rows that lack these columns
             existing_keys = set()
             cached_df = pd.DataFrame()
@@ -247,7 +246,6 @@ def enrich_dataset(df, cache_path):
             else:
                 cached_df = new_df
 
-    # Merge Part A
     if 'key' in cached_df.columns:
         cached_df = cached_df.drop(columns=['key'])
     cached_df = cached_df.drop_duplicates(
@@ -258,8 +256,7 @@ def enrich_dataset(df, cache_path):
     df = pd.merge(df, cached_df,
                   on=['Latitude', 'Longitude', 'Sample Date'], how='left')
 
-    # PART B:  Geo-enrichment (WorldCover, JRC, Geology, Population,
-    #          Water infrastructure, Water body type)
+    # Geo-enrichment (WorldCover, JRC, Geology, Population, Water infrastructure, Water body type)
     geo_cache_path = config.GEO_CACHE
 
     df['_geo_key'] = (
@@ -316,7 +313,6 @@ def enrich_dataset(df, cache_path):
             else:
                 geo_cached = new_geo
 
-    # Merge Part B
     if not geo_cached.empty:
         for c in ['_geo_key']:
             if c in geo_cached.columns:
