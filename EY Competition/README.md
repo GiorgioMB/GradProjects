@@ -59,3 +59,14 @@ The pipeline is fully resumable; API retrievals are incrementally cached to disk
 **Standard Execution (Full Pipeline):**
 ```bash
 python main.py
+```
+**Rapid Prototyping (Bypass API Enrichment):**
+```bash
+python main.py --skip-fetch
+```
+**Local Ground-Truth Validation:**
+
+Evaluates a generated submission artifact against historical DWS sensor data.
+```bash
+python main.py --score-only [FILENAME].csv
+```
