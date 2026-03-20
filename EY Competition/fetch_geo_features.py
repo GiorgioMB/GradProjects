@@ -33,7 +33,7 @@ def _safe_read_raster(href, bbox, band=1):
         return None
 
 
-#  1. ESA WorldCover 10 m  
+# ESA WorldCover 10 m  
 _WC_CLASSES = {
     10: 'tree_cover',
     20: 'shrubland',
@@ -84,7 +84,7 @@ def fetch_worldcover(lat, lon, buffer_deg=0.025):
         return empty
 
 
-#  2. JRC Global Surface Water
+# JRC Global Surface Water
 def fetch_surface_water(lat, lon, buffer_deg=0.025):
     empty = {
         "water_occurrence_mean": np.nan,
@@ -128,7 +128,7 @@ def fetch_surface_water(lat, lon, buffer_deg=0.025):
         return empty
 
 
-#  3. Geology / Lithology  (Macrostrat REST API)
+# Geology / Lithology  (Macrostrat REST API)
 _LITH_CATEGORIES = {
     'sedimentary': 0,
     'sedimentary rocks': 0,
@@ -180,9 +180,7 @@ def fetch_geology(lat, lon):
         if not records:
             return empty
 
-        # Use the most detailed record (usually last / highest source_id)
-        # Try to pick the one with a non-empty lith
-        best = records[0]
+       best = records[0]
         for rec in records:
             if rec.get("lith") and rec["lith"].strip():
                 best = rec
@@ -205,7 +203,7 @@ def fetch_geology(lat, lon):
         return empty
 
 
-#  4. Population Density 
+# Population Density 
 def fetch_population_density(lat, lon, buffer_deg=0.05):
     empty = {
         "pop_density_proxy": np.nan,
@@ -216,7 +214,6 @@ def fetch_population_density(lat, lon, buffer_deg=0.05):
         bbox = [lon - buffer_deg, lat - buffer_deg,
                 lon + buffer_deg, lat + buffer_deg]
 
-        # Try GHS-POP (Global Human Settlement Population) if available
         try:
             search = catalog.search(collections=["ghs-pop"], bbox=bbox)
             items = list(search.item_collection())
@@ -230,7 +227,7 @@ def fetch_population_density(lat, lon, buffer_deg=0.05):
         except Exception:
             pass
 
-        # Fallback / complement: WorldCover built-up fraction (wider buffer)
+        # Fallback
         search = catalog.search(collections=["esa-worldcover"], bbox=bbox)
         items = list(search.item_collection())
         if items:
@@ -245,7 +242,7 @@ def fetch_population_density(lat, lon, buffer_deg=0.05):
         return empty
 
 
-#  5. Water Infrastructure 
+# Water Infrastructure 
 def fetch_water_infrastructure(lat, lon, radius_m=10000):
     empty = {
         "dam_count_10km": 0,
@@ -297,7 +294,7 @@ def fetch_water_infrastructure(lat, lon, radius_m=10000):
         return empty
 
 
-#  6. Water Body Type Classification
+# Water Body Type Classification
 def fetch_water_body_type(lat, lon, radius_m=5000):
     empty = {
         "wbt_river_count": 0,
@@ -348,17 +345,12 @@ def fetch_water_body_type(lat, lon, radius_m=5000):
         return empty
 
 
-#  7. Combined fetcher 
+# Main
 def fetch_geo_features(row):
     lat, lon = row["Latitude"], row["Longitude"]
 
-    # ESA WorldCover (Planetary Computer)
     worldcover = fetch_worldcover(lat, lon)
-
-    # JRC Surface Water (Planetary Computer)
     surface_water = fetch_surface_water(lat, lon)
-
-    # Geology (Macrostrat)
     geology = fetch_geology(lat, lon)
     sleep(0.05)
 
