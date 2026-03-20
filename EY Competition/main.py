@@ -60,7 +60,7 @@ def main():
     enriched_path = "water_quality_post_enrichment.csv"
 
     if skip_fetch and os.path.exists(enriched_path):
-        print("\n   --skip-fetch: Loading pre-enriched data…")
+        print("\n   --skip-fetch: Loading pre-enriched data...")
         full_df = pd.read_csv(enriched_path)
         print(f"   Loaded {len(full_df)} rows, {len(full_df.columns)} cols")
 
@@ -93,7 +93,7 @@ def main():
             missing = full_df[full_df['nir08'].isna()]
             if len(missing) > 0 and not fast_mode:
                 print(f"   Fetching satellite for {len(missing)} "
-                      f"missing rows…")
+                      f"missing rows...")
                 batch = []
                 with concurrent.futures.ThreadPoolExecutor(
                         max_workers=8) as exe:
@@ -120,7 +120,7 @@ def main():
                     subset=merge_cols)
                 sat_out.to_csv(config.SAT_CACHE, index=False)
         else:
-            print("   No satellite cache found — fetching all…")
+            print("   No satellite cache found - fetching all...")
             full_df = train_df.copy()
             sat_cols = ['green', 'red', 'nir08', 'swir16', 'swir22',
                         'NDMI', 'MNDWI', 'NDVI']
@@ -220,7 +220,7 @@ def main():
         full_df, fit_imputer=True, imputer_path="imputer_state.joblib")
     full_df.to_csv("water_quality_processed_final.csv", index=False)
 
-    print("\n4b. Generating EDA report…")
+    print("\n4b. Generating EDA report...")
     try:
         eda_report.generate_report(
             input_path="water_quality_processed_final.csv",
@@ -230,7 +230,7 @@ def main():
     except Exception as e:
         print(f"   Warning: EDA report failed (non-fatal): {e}")
 
-    print("\n5. Training models (v6 DWS-centric)...")
+    print("\n5. Training models...")
     report = modeling.train_models(
         full_df, log_transform=None, use_optuna=True,
         dws_context=dws_context)
@@ -239,7 +239,6 @@ def main():
     generate_submission(train_df=full_df, report=report)
 
 
-# SUBMISSION GENERATOR  (v6 DWS-centric)
 def generate_submission(train_df, report):
     sub_path = os.path.join(config.DATA_DIR, "submission_template.csv")
     if not os.path.exists(sub_path):
@@ -249,8 +248,7 @@ def generate_submission(train_df, report):
     sub_df = pd.read_csv(sub_path)
     print(f"   {len(sub_df)} submission rows.")
 
-    # ── Satellite data for test rows ─────────────────────────────────────
-    print("   Fetching satellite for test rows…")
+    print("   Fetching satellite for test rows...")
     sat_res = []
     for _, row in tqdm(sub_df.iterrows(), total=len(sub_df)):
         sat_res.append(data_fetch.fetch_temporal_satellite(row))
@@ -263,22 +261,18 @@ def generate_submission(train_df, report):
     for c in sat_only_cols:
         test_df[c] = sat_test[c].values
 
-    # ── Enrichment (OSM + Terrain + Weather) ─────────────────────────────
     if '--fast' not in sys.argv:
         print("   Enriching test rows...")
         test_df = data_fetch.enrich_dataset(test_df, config.OSM_CACHE)
 
-    # ── Imputation ───────────────────────────────────────────────────────
     test_df = imputation.diagnose_and_impute(
         test_df, fit_imputer=False, imputer_path="imputer_state.joblib")
 
-    # ── Feature engineering (temporal, spectral, terrain, etc.) ──────────
     test_df = modeling.engineer_features(test_df)
 
-    # ── DWS features for test rows (v6 consistent) ──────────────────────
     dws_context = report.get('_dws_context')
     if dws_context is not None:
-        print("   Building DWS features for test rows (v6)…")
+        print("   Building DWS features for test rows...")
         try:
             all_dws = dws_context['all_dws']
 
@@ -338,15 +332,9 @@ def generate_submission(train_df, report):
                             test_df.at[idx, col_name] = float(
                                 prev.iloc[-1][aux])
 
-            # ── LSTM predictions computed per-target in predict loop below ─
-
-            # Drop helper columns (keep _station for LSTM)
             test_df.drop(columns=['_dws_station', 'station'],
                          errors='ignore', inplace=True)
 
-            # ── Missingness indicators (match training) ──────────────
-            # Test rows are at DWS stations, so they're like DWS data
-            # but built from competition-style enrichment
             test_df['_is_dws'] = 0  # test rows come as competition format
             test_df['_has_enrichment'] = 1  # test rows have their own satellite/terrain
             test_df['_enrichment_dist_km'] = 0.0
@@ -372,13 +360,12 @@ def generate_submission(train_df, report):
             print(f"   Warning: DWS test features failed (non-fatal): {e}")
             traceback.print_exc()
 
-    # ── KNN spatial features ─────────────────────────────────────────────
-    print("   Adding KNN spatial features…")
+    print("   Adding KNN spatial features...")
     knn_enc = report.get('_knn_encoder')
     if knn_enc is not None:
         test_df = knn_enc.transform(test_df, is_train=False)
 
-    # ── Predict (chained: EC → TAL → DRP) ──────────────────────────────
+    # Predict (chained: EC -> TAL -> DRP)
     lstm_models = report.get('_lstm_models', {})
     chain_order = report.get('_chain_order', config.TARGETS)
     chain_preds = {}  # {target: array of predictions for chaining}
@@ -393,12 +380,12 @@ def generate_submission(train_df, report):
         use_log  = report[target].get('log_transform', False)
         target_tf = report[target].get('target_transformer')
 
-        # ── Add chained predictions from upstream targets ────────────
+        # Add chained predictions from upstream targets
         for prev_target, prev_preds in chain_preds.items():
             chain_col = f'_chain_{prev_target[:3].upper()}'
             test_df[chain_col] = prev_preds
 
-        # ── Add adversarial score feature if available ───────────────
+        # Add adversarial score feature if available
         adv_clf = report.get(f'_adv_classifier_{target}')
         adv_feats = report.get(f'_adv_features_{target}')
         if adv_clf is not None and adv_feats is not None:
@@ -439,13 +426,9 @@ def generate_submission(train_df, report):
                 test_df[f] = np.nan
 
         X_test = np.array(test_df[feats], dtype=np.float64)
-        # Fix inf only; StackingEnsemble handles NaN per-model
         X_test = np.where(np.isinf(X_test), 0.0, X_test)
         raw = model.predict(X_test)
-
-        # Stacking ensemble already uses _lstm_pred as an L1 feature
-        # and learns optimal combination via L2 Ridge meta-learner.
-        # No hardcoded blending needed — the meta-learner handles it.
+        
         if target_tf is not None:
             preds = target_tf.inverse_transform(raw)
         elif use_log:
@@ -454,19 +437,6 @@ def generate_submission(train_df, report):
             preds = raw
         preds = np.nan_to_num(preds, nan=0.0, posinf=0.0, neginf=0.0)
         preds = np.clip(preds, 0, None)
-
-        # ── Per-station calibration (DISABLED — biases toward DWS
-        #    historical distribution, hurts competition scoring) ──────
-        # calibrator = report[target].get('calibrator')
-        # if calibrator is not None:
-        #     stations = test_df.get('_station')
-        #     if stations is not None:
-        #         preds_before = preds.copy()
-        #         preds = calibrator.calibrate(preds, stations.values)
-        #         diff = np.abs(preds - preds_before).mean()
-        #         print(f"   Calibration: mean |delta|={diff:.2f}")
-
-        # Store for chaining to downstream targets
         chain_preds[target] = preds
 
         sub_df[target] = preds
@@ -474,19 +444,12 @@ def generate_submission(train_df, report):
               f"std={preds.std():.2f}  "
               f"min={preds.min():.2f}  max={preds.max():.2f}")
 
-    # ── V8: Per-station PRIMARY prediction + confidence blending ──────
-    #   Per-station regression is the PRIMARY predictor (not a refinement).
-    #   Global model serves as a safety net for rows where per-station
-    #   confidence is low.
     if dws_context is not None:
-        print("\n   V8 Per-station PRIMARY prediction…")
         try:
             all_dws = dws_context['all_dws']
             ps_preds, ps_confs = modeling.per_station_predict(sub_df, all_dws)
-
-            # Variance-decompress the global model predictions
             import dws_data as dws_mod_main
-            print("   Variance decompression on global predictions…")
+            print("   Variance decompression on global predictions...")
             for target in config.TARGETS:
                 if target not in ps_preds:
                     continue
@@ -513,19 +476,12 @@ def generate_submission(train_df, report):
 
                 ps = ps_preds[target]
                 conf = ps_confs[target]
-
-                # Confidence-weighted blend:
-                #   final = α × per_station + (1 - α) × global_decompressed
-                # where α = per-station confidence (clamped)
                 alpha = np.clip(conf, 0.3, 0.95)
 
-                # For EC (near-deterministic from aux chemistry), push α higher
                 if 'Conductance' in target:
                     alpha = np.clip(conf * 1.3, 0.5, 0.98)
-                # For TAL, moderate boost
                 elif 'Alkalinity' in target:
                     alpha = np.clip(conf * 1.1, 0.4, 0.95)
-                # For DRP (hardest target), keep more conservative
                 else:
                     alpha = np.clip(conf, 0.3, 0.90)
 
@@ -557,19 +513,11 @@ def generate_submission(train_df, report):
     sub_df.to_csv(out, index=False)
     print(f"\n   Submission saved to '{out}' ({len(sub_df)} rows)")
 
-    # ── Score against DWS ground truth ───────────────────────────────────
     score_against_dws(sub_df, report)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# LOCAL SCORING – compare predictions to DWS ground truth
-# ─────────────────────────────────────────────────────────────────────────────
+# LOCAL SCORING 
 def score_against_dws(sub_df, report=None):
-    """
-    Since 100% of test rows are DWS stations with same-day measurements,
-    we can look up the actual target values and compute R² locally.
-    This gives the exact competition score without submitting.
-    """
     from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
 
     print("\n" + "=" * 65)
@@ -593,7 +541,7 @@ def score_against_dws(sub_df, report=None):
     print(f"   Station match: {n_matched}/{len(sub)} test rows")
 
     if n_matched == 0:
-        print("   No stations matched — cannot score.")
+        print("   No stations matched - cannot score.")
         return None
 
     # Look up DWS values for each test row
@@ -606,9 +554,6 @@ def score_against_dws(sub_df, report=None):
         if dws_col is None:
             print(f"   {target}: no DWS column mapping")
             continue
-
-        # NOTE: load_all_station_data() already applies unit conversions
-        # (EC ×10, DRP ×1000) so we must NOT multiply again here.
 
         y_true, y_pred = [], []
         matched, missed = 0, 0
@@ -634,14 +579,13 @@ def score_against_dws(sub_df, report=None):
                 missed += 1
                 continue
 
-            # raw_val is already unit-converted by load_all_station_data
             actual = raw_val
             y_true.append(actual)
             y_pred.append(pred)
             matched += 1
 
         if len(y_true) < 2:
-            print(f"   {target}: only {len(y_true)} matches — cannot score")
+            print(f"   {target}: only {len(y_true)} matches - cannot score")
             continue
 
         y_true = np.array(y_true)
@@ -712,7 +656,7 @@ def score_against_dws(sub_df, report=None):
 
 if __name__ == "__main__":
     if '--score-only' in sys.argv:
-        # Quick scoring mode: just score an existing submission.csv
+        # Quick scoring mode
         sub_path = "submission.csv"
         for arg in sys.argv[1:]:
             if arg.endswith('.csv') and arg != '--score-only':
@@ -726,10 +670,7 @@ if __name__ == "__main__":
         score_against_dws(sub_df)
 
     elif '--per-station' in sys.argv:
-        # Quick per-station prediction mode:
-        #   Skips global model training — only uses per-station regression
-        #   + temporal interpolation from DWS data.
-        #   Usage:  python main.py --per-station
+        # Quick per-station prediction mode
         print("=" * 60)
         print("   PER-STATION PREDICTION MODE (v7)")
         print("=" * 60)
@@ -750,7 +691,7 @@ if __name__ == "__main__":
         sub_df = pd.read_csv(sub_path)
 
         # 3. Per-station predict
-        print("\n3. Per-station prediction…")
+        print("\n3. Per-station prediction...")
         ps_preds, ps_confs = modeling.per_station_predict(sub_df, all_dws)
         for target in config.TARGETS:
             if target in ps_preds:
