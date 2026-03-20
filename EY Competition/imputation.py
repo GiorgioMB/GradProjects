@@ -96,8 +96,7 @@ def diagnose_and_impute(df, fit_imputer=True, imputer_path="imputer_state.joblib
     else:
         medians = state['medians']
 
-    # 1. Drop columns that are entirely or almost entirely NaN (>95%)
-    #    These are dead features that just get filled with a constant anyway
+    # Drop columns that are entirely or almost entirely NaN (>95%)
     num_cols = df.select_dtypes(include=[np.number]).columns
     for c in num_cols:
         frac_missing = df[c].isna().sum() / len(df)
@@ -105,8 +104,7 @@ def diagnose_and_impute(df, fit_imputer=True, imputer_path="imputer_state.joblib
             print(f"   Dropping '{c}' ({frac_missing*100:.0f}% NaN — too sparse)")
             df = df.drop(columns=[c], errors='ignore')
 
-    # 2. For remaining NaNs, use location-group median first (same lat/lon),
-    #    then fall back to global median
+    # For remaining NaNs, use location-group median first (same lat/lon), then fall back to global median
     loc_key = None
     if 'Latitude' in df.columns and 'Longitude' in df.columns:
         loc_key = (df['Latitude'].round(2).astype(str) + '_' +
@@ -117,7 +115,7 @@ def diagnose_and_impute(df, fit_imputer=True, imputer_path="imputer_state.joblib
         if n > 0:
             # Try location-group median first
             filled_by_loc = 0
-            if loc_key is not None and n < len(df):  # skip if ALL are NaN
+            if loc_key is not None and n < len(df): 
                 loc_medians = df.groupby(loc_key)[c].transform('median')
                 was_na = df[c].isna()
                 df[c] = df[c].fillna(loc_medians)
