@@ -97,15 +97,10 @@ DWS_COL_MAP = {
 _COL_FOR_TARGET = {v: k for k, v in DWS_COL_MAP.items()}
 
 # UNIT CONVERSIONS
-# DWS raw units → competition units
-# TAL: mg/L CaCO3 in both → no conversion
-# EC:  mS/m in DWS → µS/cm in competition → ×10
-#      (training EC mean=485, DWS raw EC mean=64 → 485/64≈7.6 ≈ ×10)
-# PO4: mg/L in DWS → µg/L in competition → ×1000
 DWS_UNIT_CONVERSIONS = {
-    "TAL_Diss_Water": 1.0,       # mg/L → mg/L (no conversion)
-    "EC_Phys_Water": 10.0,       # mS/m → µS/cm
-    "PO4_P_Diss_Water": 1000.0,  # mg/L → µg/L
+    "TAL_Diss_Water": 1.0,       
+    "EC_Phys_Water": 10.0,       
+    "PO4_P_Diss_Water": 1000.0, 
 }
 
 # Additional DWS columns that may be useful as auxiliary features
@@ -219,7 +214,7 @@ def discover_training_stations(train_csv_path, dws_dir, cache_path=None):
         print(f"   {len(registry)} training-location stations from cache")
         return registry
 
-    print("   No training-station cache — running full DWS discovery...")
+    print("   No training-station cache - running full DWS discovery...")
 
     # Load unique training coordinates
     train_df = pd.read_csv(train_csv_path)
@@ -395,9 +390,6 @@ def coord_to_station(lat, lon, registry=None):
 
 
 # STATION-LEVEL FEATURES
-# Per-row cutoff: uses all data strictly before each row's date.
-# For efficiency, precompute features at a few representative cutoff dates
-# and assign each row to the nearest preceding cutoff.
 def build_station_features(all_dws, cutoff_date=None):
     if cutoff_date is None:
         cutoff_date = pd.Timestamp("2015-12-31")
@@ -411,7 +403,7 @@ def build_station_features(all_dws, cutoff_date=None):
     for station, df in all_dws.items():
         hist = df[df["date"] <= cutoff_date].copy()
         if len(hist) < 3:
-            hist = df.copy()  # last resort — use everything
+            hist = df.copy()  # last resort - use everything
 
         feats = {}
 
@@ -486,11 +478,9 @@ def build_station_features(all_dws, cutoff_date=None):
     return feat_df
 
 
-# PER-ROW LAG FEATURES
 def add_lag_features(df, all_dws, targets):
     print("   Computing DWS lag features...")
 
-    # Parse the date column for the DataFrame
     if "date" not in df.columns or df["date"].dtype == object:
         if "Sample Date" in df.columns:
             df["date"] = pd.to_datetime(df["Sample Date"], dayfirst=True)
@@ -633,21 +623,7 @@ def build_augmented_rows(all_dws, test_df, date_range=("2000-01-01", "2015-12-31
 
 # SAME-DAY AUXILIARY FEATURES FOR TEST ROWS
 def add_sameday_aux_features(df, all_dws):
-    """
-    For each row in df, look up same-day auxiliary DWS measurements
-    (pH, Ca, Mg, Na, Cl, SO4, Si, NH4, NO3, F, K, DMS, P_Tot).
-
-    These are non-target variables measured on the same sampling date.
-    They provide strong chemical context — e.g., pH and Ca/Mg strongly
-    predict Total Alkalinity; NH4/NO3 predict DRP.
-
-    This is NOT leakage: we're using auxiliary measurements (not target
-    values) from a publicly available database.
-
-    Works on both training and test DataFrames.
-    Vectorised via merge (fast even for 10K+ rows).
-    """
-    print("   Adding same-day auxiliary DWS features …")
+    print("   Adding same-day auxiliary DWS features ...")
 
     if "date" not in df.columns or df["date"].dtype == object:
         if "Sample Date" in df.columns:
@@ -885,13 +861,7 @@ def prepare_dws_augmentation(dws_dir, targets, test_df, train_df=None,
     return all_dws, station_features, aug_rows
 
 
-# ── NEIGHBOR / UPSTREAM FEATURES ────────────────────────────────────────
-# Stations in the same primary drainage region share the same river system.
-# We compute features from the nearest neighbor stations' recent data
-# to capture upstream / lateral influences on water quality.
-
 def _get_neighbor_stations(station, registry, max_neighbors=5, max_dist_deg=2.0):
-    """Find neighbor stations in the same primary drainage region."""
     if station not in registry:
         return []
     primary = station[0]  # first letter = primary drainage region
@@ -908,14 +878,6 @@ def _get_neighbor_stations(station, registry, max_neighbors=5, max_dist_deg=2.0)
 
 
 def build_neighbor_features(df, all_dws, registry=None):
-    """
-    For each row, compute features from neighbor stations in the same
-    river system.  Uses the most recent measurement BEFORE the row's date
-    at each neighbor, then aggregates across neighbors (IDW-weighted).
-
-    Features: neighbor_{TAL,EC,DRP}_{mean,min,max}, neighbor_n_stations,
-              neighbor_mean_dist
-    """
     if registry is None:
         registry = _FULL_REGISTRY or STATION_REGISTRY
 
