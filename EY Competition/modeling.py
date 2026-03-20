@@ -9,7 +9,7 @@ try:
     import lightgbm as lgb
     HAS_LGB = True
 except ImportError:
-    warnings.warn("LightGBM not installed – ensemble will skip it.")
+    warnings.warn("LightGBM not installed - ensemble will skip it.")
     HAS_LGB = False
 
 try:
@@ -39,7 +39,7 @@ from scipy import stats as sp_stats
 import joblib
 import config
 
-# ── Multi-target chaining order ──────────────────────────────────────────────
+# Multi-target chaining order 
 # EC first (strongest aux correlations), then TAL, then DRP (weakest, benefits
 # from EC/TAL predictions as features).
 CHAIN_ORDER = [
@@ -48,18 +48,12 @@ CHAIN_ORDER = [
     'Dissolved Reactive Phosphorus',
 ]
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 0.  FEATURE ENGINEERING
-# ─────────────────────────────────────────────────────────────────────────────
+# FEATURE ENGINEERING 
 def engineer_features(df):
-    """
-    Create features available for both DWS rows and competition rows.
-    Temporal, spectral, terrain, weather, and land cover features.
-    """
     df = df.copy()
     eps = 1e-8
 
-    # ── Temporal ─────────────────────────────────────────────────────────
+    #  Temporal 
     if 'Sample Date' in df.columns:
         dt = pd.to_datetime(df['Sample Date'], dayfirst=True)
         df['Month']     = dt.dt.month
@@ -70,7 +64,7 @@ def engineer_features(df):
         df['DayOfYear_sin'] = np.sin(2 * np.pi * df['DayOfYear'] / 365.25)
         df['DayOfYear_cos'] = np.cos(2 * np.pi * df['DayOfYear'] / 365.25)
 
-    # ── Spectral indices ─────────────────────────────────────────────────
+    #  Spectral indices 
     if 'nir08' in df.columns and 'red' in df.columns:
         df['NDVI'] = (df['nir08'] - df['red']) / (df['nir08'] + df['red'] + eps)
     if 'green' in df.columns and 'nir08' in df.columns:
@@ -85,19 +79,19 @@ def engineer_features(df):
         df['BSI'] = (((df['swir16'] + df['red']) - (df['nir08'] + df['green'])) /
                      ((df['swir16'] + df['red']) + (df['nir08'] + df['green']) + eps))
 
-    # ── Elevation / slope ────────────────────────────────────────────────
+    #  Elevation / slope 
     if 'elevation_mean' in df.columns:
         df['log_Elev'] = np.log1p(np.clip(df['elevation_mean'], 0, None))
         if 'slope_mean' in df.columns:
             df['Elev_Slope'] = df['elevation_mean'] * df['slope_mean']
 
-    # ── Rainfall ─────────────────────────────────────────────────────────
+    #  Rainfall 
     if 'rain_7d_sum' in df.columns and 'rain_30d_sum' in df.columns:
         df['Rain_7d_frac'] = df['rain_7d_sum'] / (df['rain_30d_sum'] + eps)
     if 'elevation_mean' in df.columns and 'rain_30d_sum' in df.columns:
         df['Elev_Rain'] = df['elevation_mean'] * df['rain_30d_sum']
 
-    # ── Land cover interactions ──────────────────────────────────────────
+    #  Land cover interactions 
     if 'lc_cropland' in df.columns and 'rain_30d_sum' in df.columns:
         df['Cropland_Rain'] = df['lc_cropland'] * df['rain_30d_sum']
     if 'lc_built_up' in df.columns and 'rain_30d_sum' in df.columns:
@@ -111,21 +105,18 @@ def engineer_features(df):
                      df.get('lc_bare_sparse', 0))
         df['Natural_vs_Disturbed'] = natural / (disturbed + eps)
 
-    # ── Geology ──────────────────────────────────────────────────────────
+    #  Geology 
     if 'geo_is_karst' in df.columns and 'rain_30d_sum' in df.columns:
         df['Karst_Rain'] = df['geo_is_karst'] * df['rain_30d_sum']
 
-    # ── Dam proximity ────────────────────────────────────────────────────
+    #  Dam proximity 
     if 'nearest_dam_dist_m' in df.columns:
         df['log_Dam_dist'] = np.log1p(np.clip(df['nearest_dam_dist_m'], 0, None))
 
     return df
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 0b.  KNN SPATIAL FEATURES (chemistry-based, no target leakage)
-# ─────────────────────────────────────────────────────────────────────────────
-# Auxiliary chemistry columns used for KNN features (generalise across stations)
+# KNN SPATIAL FEATURES (chemistry-based, no target leakage)
 _KNN_AUX_COLS = [
     'dws_aux_pH_Diss_Water', 'dws_aux_Ca_Diss_Water',
     'dws_aux_Mg_Diss_Water', 'dws_aux_Na_Diss_Water',
@@ -134,13 +125,6 @@ _KNN_AUX_COLS = [
 ]
 
 class SpatialKNNEncoder:
-    """KNN from training locations → auxiliary chemistry means + distance.
-
-    v7 change: NO target-mean KNN features (those caused station memorisation
-    and catastrophic OOD failure).  Instead we encode the *chemistry regime*
-    of nearby locations, which generalises because it's the chemistry that
-    drives water quality.
-    """
     def __init__(self, targets, k_values=(5, 10)):
         self.targets  = targets
         self.k_values = k_values
@@ -150,7 +134,6 @@ class SpatialKNNEncoder:
         coords = np.deg2rad(df[['Latitude', 'Longitude']].values)
         self.tree_ = BallTree(coords, metric='haversine')
         self.train_coords_ = coords
-        # Store auxiliary chemistry values (NOT targets)
         self.train_aux_ = {}
         for col in _KNN_AUX_COLS:
             if col in df.columns:
@@ -169,8 +152,6 @@ class SpatialKNNEncoder:
         if is_train:
             inds_all  = inds_all[:, 1:]
             dists_all = dists_all[:, 1:]
-
-        # Chemistry-based KNN: mean of nearby stations' auxiliary chemistry
         for col in self.train_aux_:
             short = col.replace('dws_aux_', '').replace('_Diss_Water', '')\
                        .replace('_Tot_Water', '')
@@ -196,9 +177,7 @@ class SpatialKNNEncoder:
         return df
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 0c.  STATION LSTM – temporal model for per-station time series
-# ─────────────────────────────────────────────────────────────────────────────
+# STATION LSTM - temporal model for per-station time series
 try:
     import torch
     import torch.nn as nn
@@ -209,7 +188,6 @@ except ImportError:
     nn = None
 
 class _LSTMNet(nn.Module):
-    """Small LSTM for station time-series regression."""
     def __init__(self, input_dim, hidden=64, n_layers=2, dropout=0.2):
         super().__init__()
         self.lstm = nn.LSTM(input_dim, hidden, n_layers,
@@ -432,8 +410,7 @@ class StationLSTMModel:
         X_pad, L = self._pad_sequences(sequences, lengths)
         y_t = torch.tensor(y, dtype=torch.float32)
 
-        # Train/val split — TEMPORAL: last 20% of dates for validation
-        # This prevents future-leaking and gives a more realistic estimate
+        # Train/val split 
         n = len(y)
         row_dates = self._get_row_dates(rows_df)
         if row_dates is not None:
@@ -506,8 +483,6 @@ class StationLSTMModel:
 
         if best_state is not None:
             self.model_.load_state_dict(best_state)
-
-        # Report validation R²
         self.model_.eval()
         with torch.no_grad():
             va_pred = self.model_(X_pad[va_idx], L[va_idx]).numpy()
@@ -519,7 +494,7 @@ class StationLSTMModel:
                 va_pred_real, va_true_real = va_pred, va_true
             va_pred_real = np.clip(va_pred_real, 0, None)
             va_r2 = r2_score(va_true_real, va_pred_real)
-        print(f"      LSTM: val R²={va_r2:.4f} (best_loss={best_val_loss:.4f})")
+        print(f"      LSTM: val R2={va_r2:.4f} (best_loss={best_val_loss:.4f})")
         return self
 
     def predict(self, all_dws, rows_df, exclude_dates=None):
@@ -569,25 +544,9 @@ class StationLSTMModel:
         return preds
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 1.  DWS FEATURE BUILDER (the core of v6)
-# ─────────────────────────────────────────────────────────────────────────────
+
+# DWS FEATURE BUILDER
 def build_dws_training_set(all_dws, targets, exclude_dates=None):
-    """
-    Build the training dataset from DWS station data.  **Vectorised.**
-
-    Uses ALL stations in all_dws (not just test stations).
-    exclude_dates: dict {station_code: set_of_datetime.date} — rows at
-                   these (station, date) pairs are skipped to prevent
-                   target leakage from test data.
-
-    Returns a DataFrame with:
-      - Target columns (unit-converted)
-      - Same-day auxiliary chemistry (dws_aux_*)
-      - Lag features (previous measurement, rolling means)
-      - Temporal features (month, season)
-      - Latitude / Longitude / Sample Date (for enrichment merging)
-    """
     import dws_data as dws_mod
 
     DWS_COL_MAP = dws_mod.DWS_COL_MAP
@@ -608,7 +567,7 @@ def build_dws_training_set(all_dws, targets, exclude_dates=None):
 
         sf = sdf.sort_values('date').reset_index(drop=True).copy()
 
-        # ── Exclude test dates ───────────────────────────────────────
+        #  Exclude test dates 
         if stn_excluded:
             keep = ~sf['date'].dt.date.isin(stn_excluded)
             n_excluded += (~keep).sum()
@@ -617,7 +576,7 @@ def build_dws_training_set(all_dws, targets, exclude_dates=None):
         if len(sf) == 0:
             continue
 
-        # ── Targets ──────────────────────────────────────────────────
+        #  Targets 
         for dws_col, target in DWS_COL_MAP.items():
             sf[target] = pd.to_numeric(sf.get(dws_col), errors='coerce')
         # Keep rows where at least one target is non-NaN
@@ -626,7 +585,7 @@ def build_dws_training_set(all_dws, targets, exclude_dates=None):
         if len(sf) == 0:
             continue
 
-        # ── Metadata ─────────────────────────────────────────────────
+        #  Metadata 
         sf['Latitude'] = lat
         sf['Longitude'] = lon
         sf['Sample Date'] = sf['date'].dt.strftime('%d-%m-%Y')
@@ -637,11 +596,11 @@ def build_dws_training_set(all_dws, targets, exclude_dates=None):
         sf['_has_stn_hist'] = 1
         sf['_has_enrichment'] = 0  # set to 1 later by _merge_enrichment_to_dws
 
-        # ── Same-day auxiliary chemistry ─────────────────────────────
+        #  Same-day auxiliary chemistry 
         for aux in DWS_AUX_COLS:
             sf[f'dws_aux_{aux}'] = pd.to_numeric(sf.get(aux), errors='coerce')
 
-        # ── Temporal ─────────────────────────────────────────────────
+        #  Temporal 
         dt = sf['date']
         sf['Month'] = dt.dt.month
         sf['Month_sin'] = np.sin(2 * np.pi * sf['Month'] / 12)
@@ -651,7 +610,7 @@ def build_dws_training_set(all_dws, targets, exclude_dates=None):
         sf['DayOfYear_cos'] = np.cos(2 * np.pi * sf['DayOfYear'] / 365.25)
         sf['Year'] = dt.dt.year
 
-        # ── Lag features (vectorised via shift / rolling) ────────────
+        #  Lag features (vectorised via shift / rolling) 
         for dws_col, target in DWS_COL_MAP.items():
             pfx = target[:3].upper()
             vals = pd.to_numeric(sf.get(dws_col), errors='coerce')
@@ -689,7 +648,7 @@ def build_dws_training_set(all_dws, targets, exclude_dates=None):
 
             # First row has no history → NaN (shift already handles this)
 
-        # ── Lag for key auxiliary chemistry (vectorised) ─────────────
+        #  Lag for key auxiliary chemistry (vectorised) 
         for aux in ['pH_Diss_Water', 'Ca_Diss_Water', 'Mg_Diss_Water',
                     'Na_Diss_Water', 'Cl_Diss_Water', 'SO4_Diss_Water']:
             if aux in sf.columns:
@@ -700,7 +659,7 @@ def build_dws_training_set(all_dws, targets, exclude_dates=None):
 
         station_frames.append(sf)
 
-    # ── Assemble ─────────────────────────────────────────────────────
+    #  Assemble 
     # Select only the columns we need (drop raw DWS columns)
     keep_prefixes = ('Latitude', 'Longitude', 'Sample Date', '_station',
                      '_is_dws', '_has_dws', '_has_stn', '_has_enrichment',
@@ -729,17 +688,6 @@ def build_dws_training_set(all_dws, targets, exclude_dates=None):
 
 
 def add_station_historical_features(df, all_dws):
-    """
-    Add station-level historical statistics as features.
-
-    v7 change: ONLY auxiliary chemistry stats (pH, Ca, Mg, Na, Cl, SO4, F).
-    Target-level stats (stn_TAL_mean, stn_EC_mean, stn_DRP_mean, …) are
-    REMOVED because they cause station memorisation → catastrophic OOD
-    failure (R²=-72 on unseen stations).
-
-    Chemistry stats generalise because they describe the geochemical
-    regime, not the target value itself.
-    """
     import dws_data as dws_mod
     full_registry = dws_mod._FULL_REGISTRY or dws_mod.STATION_REGISTRY
 
@@ -793,18 +741,8 @@ def add_station_historical_features(df, all_dws):
     return df
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 1b.  TIME-WEIGHTED STATION FEATURES (exponential decay)
-# ─────────────────────────────────────────────────────────────────────────────
+# TIME-WEIGHTED STATION FEATURES (exponential decay)
 def add_time_weighted_station_features(df, all_dws, halflife_days=730):
-    """
-    Add exponentially-weighted recent station averages alongside all-time
-    averages.  Recent chemistry (last ~2 years) is more predictive of
-    current water quality than decade-old measurements.
-
-    halflife_days: exponential decay half-life (default 730 = 2 years).
-    Halving time: a measurement 2 years old gets weight 0.5, 4 years → 0.25.
-    """
     import dws_data as dws_mod
     full_registry = dws_mod._FULL_REGISTRY or dws_mod.STATION_REGISTRY
     decay = np.log(2) / halflife_days
@@ -866,20 +804,7 @@ def add_time_weighted_station_features(df, all_dws, halflife_days=730):
           f"for {len(tw_df)} stations (halflife={halflife_days}d)")
     return df
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 1c.  ADVERSARIAL VALIDATION  (detect train/test distribution shift)
-# ─────────────────────────────────────────────────────────────────────────────
 def adversarial_validation(train_df, test_df, features, top_k=5):
-    """
-    Train a classifier to distinguish train vs test rows.
-    Features highly predictive of "is_test" reveal distribution shift.
-
-    Returns:
-      - adv_importances: dict {feature: importance}  (sorted desc)
-      - adv_auc: AUC of the adversarial classifier
-      - shift_features: top_k features most predictive of test
-    """
     from sklearn.model_selection import cross_val_predict
     from sklearn.metrics import roc_auc_score
 
@@ -920,27 +845,17 @@ def adversarial_validation(train_df, test_df, features, top_k=5):
 
     print(f"   Adversarial validation: AUC={auc:.3f}")
     if auc > 0.7:
-        print(f"   ⚠ Significant distribution shift detected!")
+        print(f"   Significant distribution shift detected!")
         print(f"   Top shift features: {shift_features}")
     else:
-        print(f"   Low shift (AUC={auc:.3f}) — train/test distributions similar")
+        print(f"   Low shift (AUC={auc:.3f}) - train/test distributions similar")
 
     return imp_dict, auc, shift_features
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 1d.  STATION-AWARE SAMPLE WEIGHTING
-# ─────────────────────────────────────────────────────────────────────────────
+# STATION-AWARE SAMPLE WEIGHTING
 def compute_station_weights(df, test_stations, base_weight=1.0,
                             test_station_weight=4.0):
-    """
-    Compute per-row sample weights.  Rows from test-location stations
-    get higher weight because they're directly relevant.
-
-    test_stations: set of station codes that appear in test data
-    base_weight:   weight for non-test-station rows
-    test_station_weight: weight for rows from test stations
-    """
     stations = df.get('_station')
     if stations is None:
         return np.ones(len(df))
@@ -953,16 +868,8 @@ def compute_station_weights(df, test_stations, base_weight=1.0,
     return weights
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 2.  TARGET-SPECIFIC TRANSFORMS + MODEL CONFIGS
-# ─────────────────────────────────────────────────────────────────────────────
+# TARGET-SPECIFIC TRANSFORMS + MODEL CONFIGS
 class TargetTransformer:
-    """Per-target optimal transform instead of blanket log1p.
-
-    EC  (roughly log-normal)         → log1p           (standard)
-    TAL (moderate skew)              → Yeo-Johnson     (handles negatives, moderate skew)
-    DRP (heavy right skew, near-zero)→ log1p(x + ε)    (shift avoids log(0) issues)
-    """
     def __init__(self, method='log1p'):
         self.method = method   # 'log1p' | 'yeojohnson' | 'shifted_log'
         self._yj = None
@@ -977,7 +884,7 @@ class TargetTransformer:
             self._yj = PowerTransformer(method='yeo-johnson', standardize=False)
             return self._yj.fit_transform(y.reshape(-1, 1)).ravel()
         elif self.method == 'shifted_log':
-            # Shift: log1p(y + 1) — extra shift for near-zero DRP
+            # Shift: log1p(y + 1) - extra shift for near-zero DRP
             return np.log1p(y + self._shift)
         return y
 
@@ -1008,7 +915,6 @@ class TargetTransformer:
 
 
 def _get_target_transform(target_name):
-    """Return the optimal TargetTransformer for each target."""
     if 'Phosphorus' in target_name:
         return TargetTransformer('shifted_log')   # heavy right skew, many near-zero
     elif 'Conductance' in target_name:
@@ -1018,15 +924,9 @@ def _get_target_transform(target_name):
 
 
 def _get_models_for_target(target_name):
-    """
-    Returns (list_of_(name, estimator), TargetTransformer).
-
-    v7: target-specific transforms instead of blanket log1p.
-    """
     target_tf = _get_target_transform(target_name)
 
     if 'Phosphorus' in target_name:
-        # DRP is very noisy — Huber loss is more robust to outliers
         xgb_p = dict(
             objective='reg:pseudohubererror',
             n_estimators=1000, learning_rate=0.025, max_depth=3,
@@ -1043,7 +943,6 @@ def _get_models_for_target(target_name):
             n_jobs=-1, random_state=42, verbose=-1,
         )
     elif 'Conductance' in target_name:
-        # EC has strong aux correlations — moderate regularisation
         xgb_p = dict(
             n_estimators=1200, learning_rate=0.025, max_depth=4,
             min_child_weight=60, subsample=0.65, colsample_bytree=0.35,
@@ -1084,12 +983,10 @@ def _get_models_for_target(target_name):
             subsample=0.65, colsample_bylevel=0.35,
             min_data_in_leaf=60,
         )
-        # Huber loss for DRP — robust to outliers
         if 'Phosphorus' in target_name:
             cb_p['loss_function'] = 'Huber:delta=1.0'
         estimators.append(('cb', CatBoostRegressor(**cb_p)))
 
-    # Extra-Trees — deeper config for better expressiveness & ensemble diversity
     et_pipe = Pipeline([
         ('imputer', SimpleImputer(strategy='median')),
         ('et', ExtraTreesRegressor(
@@ -1099,16 +996,6 @@ def _get_models_for_target(target_name):
     ])
     estimators.append(('et', et_pipe))
 
-    # Ridge — REMOVED: produces R²=-inf in multiple CV folds,
-    # destabilises the L2 meta-learner despite near-zero weight.
-    # ridge_pipe = Pipeline([
-    #     ('imputer', SimpleImputer(strategy='median')),
-    #     ('scaler', StandardScaler()),
-    #     ('ridge', Ridge(alpha=50.0)),
-    # ])
-    # estimators.append(('ridge', ridge_pipe))
-
-    # HistGradientBoosting — sklearn native, handles NaN, fast, adds diversity
     hgb = HistGradientBoostingRegressor(
         max_iter=1000, learning_rate=0.025, max_depth=4,
         min_samples_leaf=60, max_leaf_nodes=15,
@@ -1120,9 +1007,7 @@ def _get_models_for_target(target_name):
     return estimators, target_tf
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 2b.  PER-STATION CALIBRATION
-# ─────────────────────────────────────────────────────────────────────────────
+# PER-STATION CALIBRATION
 class StationCalibrator:
     """
     Post-prediction calibration using each station's historical distribution.
@@ -1156,7 +1041,7 @@ class StationCalibrator:
         for stn, sdf in all_dws.items():
             vals = pd.to_numeric(sdf.get(dws_col, pd.Series(dtype=float)),
                                 errors='coerce')
-            # NO unit conversion — already done in load_all_station_data
+            # NO unit conversion - already done in load_all_station_data
             # Exclude test dates
             if stn in exclude_dates:
                 keep = ~sdf['date'].dt.date.isin(exclude_dates[stn])
@@ -1188,8 +1073,8 @@ class StationCalibrator:
     def calibrate(self, preds, stations):
         """Apply per-station calibration to predictions.
 
-        preds: array of shape (N,) — raw model predictions
-        stations: array of shape (N,) — station codes (can have NaN)
+        preds: array of shape (N,) - raw model predictions
+        stations: array of shape (N,) - station codes (can have NaN)
 
         Returns calibrated predictions.
         """
@@ -1225,15 +1110,14 @@ class StationCalibrator:
         return calibrated
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 3.  STACKING ENSEMBLE  (SOTA: 2-layer stacking, per AutoGluon architecture)
-# ─────────────────────────────────────────────────────────────────────────────
+# STACKING ENSEMBLE
 class StackingEnsemble(BaseEstimator, RegressorMixin):
     """
-    2-layer stacking ensemble — the SOTA architecture for tabular ML.
+    2-layer stacking ensemble
 
     L1:  Base models (XGB, LGB, CB, HGB, ET, Ridge) trained with K-fold CV.
          Out-of-fold (OOF) predictions are collected.
+         
     L2:  RidgeCV meta-learner learns optimal combination weights from OOF.
     Predict:  Bagged L1 predictions (averaged across K fold-models) → L2.
 
@@ -1285,7 +1169,7 @@ class StackingEnsemble(BaseEstimator, RegressorMixin):
                  if sample_weight is not None else None)
         n = len(y_arr)
 
-        # ── Set up CV splits ───────────────────────────────────────────
+        #  Set up CV splits 
         n_splits = self.n_folds
         if groups is not None:
             n_unique = len(set(groups))
@@ -1301,7 +1185,7 @@ class StackingEnsemble(BaseEstimator, RegressorMixin):
         oof_preds = np.full((n, n_models), np.nan)
         fold_models = {name: [] for name, _ in self.estimators}
 
-        # ── Step 1: Generate OOF predictions via K-fold CV ─────────────
+        # Generate OOF predictions via K-fold CV 
         for fi, (tr_idx, va_idx) in enumerate(splits):
             for mi, (name, est) in enumerate(self.estimators):
                 try:
@@ -1320,16 +1204,16 @@ class StackingEnsemble(BaseEstimator, RegressorMixin):
                     warnings.warn(f"   {name} failed in fold {fi}: {e}")
                     oof_preds[va_idx, mi] = np.nanmean(y_arr)
 
-        # ── Report per-L1-model OOF R² ─────────────────────────────────
+        # Report OOF R2
         for mi, (name, _) in enumerate(self.estimators):
             valid = np.isfinite(oof_preds[:, mi])
             if valid.sum() > 10:
                 r2 = max(r2_score(y_arr[valid], oof_preds[valid, mi]), 0.0)
             else:
                 r2 = 0.0
-            print(f"      {name:>8s}: OOF R²={r2:.4f}")
+            print(f"      {name:>8s}: OOF R2={r2:.4f}")
 
-        # ── Step 2: Train L2 meta-learner on OOF predictions ───────────
+        # Train L2 meta-learner on OOF predictions 
         valid = np.all(np.isfinite(oof_preds), axis=1)
         if valid.sum() >= 20:
             self.meta_learner_ = Pipeline([
@@ -1341,7 +1225,7 @@ class StackingEnsemble(BaseEstimator, RegressorMixin):
             self.meta_learner_.fit(oof_preds[valid], y_arr[valid])
             meta_preds = self.meta_learner_.predict(oof_preds[valid])
             meta_r2 = r2_score(y_arr[valid], meta_preds)
-            print(f"      {'L2 stack':>8s}: OOF R²={meta_r2:.4f}")
+            print(f"      {'L2 stack':>8s}: OOF R2={meta_r2:.4f}")
 
             # Report effective weights
             ridge_m = self.meta_learner_.named_steps['ridge']
@@ -1356,7 +1240,7 @@ class StackingEnsemble(BaseEstimator, RegressorMixin):
             print("      Warning: insufficient OOF data, using equal weights")
             self.meta_learner_ = None
 
-        # ── Step 3: Retrain all L1 models on full data ─────────────────
+        # Retrain all L1 models on full data 
         self.fitted_models_ = []
         self.model_names_ = []
         for name, est in self.estimators:
@@ -1377,7 +1261,7 @@ class StackingEnsemble(BaseEstimator, RegressorMixin):
         n = len(X_raw)
         n_models = len(self.fitted_models_)
 
-        # ── L1 predictions: bagged (averaged across fold models) ───────
+        #  L1 predictions: bagged (averaged across fold models) 
         l1_preds = np.zeros((n, n_models))
         for mi, name in enumerate(self.model_names_):
             fold_ms = self.fold_models_.get(name, [])
@@ -1397,11 +1281,9 @@ class StackingEnsemble(BaseEstimator, RegressorMixin):
                     self.fitted_models_[mi].predict(X_m),
                     nan=0.0, posinf=0.0, neginf=0.0)
 
-        # ── L2 meta-learner combination ────────────────────────────────
         if self.meta_learner_ is not None:
             return self.meta_learner_.predict(l1_preds)
         else:
-            # Fallback: equal-weight average
             return l1_preds.mean(axis=1)
 
 
@@ -1409,7 +1291,7 @@ class MultiSeedEnsemble(BaseEstimator, RegressorMixin):
     """
     Train N StackingEnsembles with different random seeds and average.
 
-    This reduces variance by ~1/sqrt(N) — standard in every top Kaggle
+    This reduces variance by ~1/sqrt(N) - standard in every top Kaggle
     solution.  Each seed perturbs:
       - The K-fold split (different random KFold)
       - The random_state of all L1 tree models
@@ -1449,8 +1331,8 @@ class MultiSeedEnsemble(BaseEstimator, RegressorMixin):
         seeds = [42 + i * 1000 for i in range(self.n_seeds)]
 
         for si, seed in enumerate(seeds):
-            print(f"\n   ── Multi-seed round {si+1}/{self.n_seeds} "
-                  f"(seed={seed}) ──")
+            print(f"\n    Multi-seed round {si+1}/{self.n_seeds} "
+                  f"(seed={seed}) ")
             reseeded = self._reseeded_estimators(
                 self.base_estimators, seed)
             ens = StackingEnsemble(reseeded, n_folds=self.n_folds)
@@ -1467,13 +1349,11 @@ class MultiSeedEnsemble(BaseEstimator, RegressorMixin):
         return np.mean(all_preds, axis=0)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 4.  EVALUATION  (leave-station-out CV with per-fold KNN)
-# ─────────────────────────────────────────────────────────────────────────────
+# EVALUATION  (leave-station-out CV with per-fold KNN)
 def evaluate_model(df_full, features, target, groups, estimators, use_log,
                    knn_targets, knn_k=(5, 10)):
     """Spatial GroupKFold CV with KNN recomputed per fold."""
-    print(f"\n   Evaluating {target} (leave-station-out, log={use_log})…")
+    print(f"\n   Evaluating {target} (leave-station-out, log={use_log})...")
 
     y_arr = df_full[target].values.astype(np.float64)
     g_arr = np.array(groups)
@@ -1509,9 +1389,9 @@ def evaluate_model(df_full, features, target, groups, estimators, use_log,
 
         y_fit = np.log1p(np.clip(y_tr, 0, None)) if use_log else y_tr
 
-        print(f"\n   ── Fold {fi+1}/{n_splits} "
+        print(f"\n    Fold {fi+1}/{n_splits} "
               f"(train={len(tri)}, test={len(tei)}, "
-              f"train_locs={len(set(g_tr))}) ──")
+              f"train_locs={len(set(g_tr))}) ")
 
         # Train a StackingEnsemble on this fold (matches submission model)
         fold_stack = StackingEnsemble(estimators, n_folds=min(3, len(set(g_tr))))
@@ -1545,30 +1425,20 @@ def evaluate_model(df_full, features, target, groups, estimators, use_log,
         tr_r2 = r2_score(y_tr, tr_p)
         fold_train_r2.append(tr_r2)
         gap = tr_r2 - r2
-        print(f"      Fold {fi+1}: Train R²={tr_r2:.4f}  Test R²={r2:.4f}  "
+        print(f"      Fold {fi+1}: Train R2={tr_r2:.4f}  Test R2={r2:.4f}  "
               f"Gap={gap:.4f}  RMSE={rmse:.1f}")
 
     mr2 = np.mean(fold_r2)
     mg  = np.mean(fold_train_r2) - mr2
-    print(f"\n   CV ({n_splits}-fold):  R²={mr2:.4f} "
+    print(f"\n   CV ({n_splits}-fold):  R2={mr2:.4f} "
           f"(±{np.std(fold_r2):.3f})  "
           f"RMSE={np.mean(fold_rmse):.1f}  MAE={np.mean(fold_mae):.1f}")
-    print(f"   Avg Train R²={np.mean(fold_train_r2):.4f}  Avg Gap={mg:.4f}")
+    print(f"   Avg Train R2={np.mean(fold_train_r2):.4f}  Avg Gap={mg:.4f}")
     return mr2, np.mean(fold_rmse)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 5.  FEATURE IMPORTANCE PRUNING
-# ─────────────────────────────────────────────────────────────────────────────
+# FEATURE IMPORTANCE PRUNING
 def _drop_station_constant_features(df, features, groups, threshold=0.03):
-    """Drop features that are constant within stations (station fingerprints).
-
-    A feature that has near-zero within-group variance relative to total
-    variance is essentially a station ID in disguise.  These cause massive
-    overfitting in leave-station-out CV.
-
-    threshold: minimum ratio of within-group std to total std to keep.
-    """
     g_arr = np.array(groups)
     kept, dropped = [], []
     for f in features:
@@ -1595,9 +1465,6 @@ def _drop_station_constant_features(df, features, groups, threshold=0.03):
 
 
 def prune_features(X, y, features, use_log, groups=None, min_features=30):
-    """Quick XGB fit → drop zero-importance + station-constant features."""
-
-    # First drop station-constant features if groups are provided
     if groups is not None and isinstance(X, pd.DataFrame):
         features = _drop_station_constant_features(X, features, groups)
 
@@ -1629,19 +1496,12 @@ def prune_features(X, y, features, use_log, groups=None, min_features=30):
     return keep
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 6.  OPTUNA HYPERPARAMETER SEARCH
-# ─────────────────────────────────────────────────────────────────────────────
+# OPTUNA HYPERPARAMETER SEARCH
 def _optuna_search(X, y, groups, use_log, target_name, n_trials=80):
-    """Optuna search over XGB hyperparameters with spatial regularization.
-
-    Uses subsampling (max 40K rows) for speed — standard practice for
-    hyperparameter search on large datasets.
-    """
     if not HAS_OPTUNA:
         return None
 
-    print(f"   Running Optuna ({n_trials} trials)…")
+    print(f"   Running Optuna ({n_trials} trials)...")
     y_fit = np.log1p(np.clip(y, 0, None)) if use_log else y
     X_arr = np.array(X, dtype=np.float64)
     X_arr = np.where(np.isinf(X_arr), 0.0, X_arr)  # fix inf, keep NaN
@@ -1712,17 +1572,16 @@ def _optuna_search(X, y, groups, use_log, target_name, n_trials=80):
     best['reg_alpha'] = best.pop('alpha')
     best['reg_lambda'] = best.pop('lambda')
     best['n_estimators'] = best.pop('n_est')
-    print(f"   Best Optuna R²: {study.best_value:.4f}")
+    print(f"   Best Optuna R2: {study.best_value:.4f}")
     print(f"   Best params: {best}")
     return best
 
 
 def _optuna_search_lgb(X, y, groups, use_log, target_name, n_trials=50):
-    """Optuna search over LightGBM hyperparameters."""
     if not HAS_OPTUNA or not HAS_LGB:
         return None
 
-    print(f"   Running Optuna-LGB ({n_trials} trials)…")
+    print(f"   Running Optuna-LGB ({n_trials} trials)...")
     y_fit = np.log1p(np.clip(y, 0, None)) if use_log else y
     X_arr = np.array(X, dtype=np.float64)
     X_arr = np.where(np.isinf(X_arr), 0.0, X_arr)
@@ -1798,7 +1657,7 @@ def _optuna_search_lgb(X, y, groups, use_log, target_name, n_trials=50):
     best['n_estimators'] = best.pop('n_est')
     if 'huber_delta' in best:
         best['alpha'] = best.pop('huber_delta')
-    print(f"   Best Optuna-LGB R²: {study.best_value:.4f}")
+    print(f"   Best Optuna-LGB R2: {study.best_value:.4f}")
     print(f"   Best LGB params: {best}")
     return best
 
@@ -1808,11 +1667,11 @@ def _optuna_search_cb(X, y, groups, use_log, target_name, n_trials=40):
     if not HAS_OPTUNA or not HAS_CB:
         return None
 
-    print(f"   Running Optuna-CB ({n_trials} trials)…")
+    print(f"   Running Optuna-CB ({n_trials} trials)...")
     y_fit = np.log1p(np.clip(y, 0, None)) if use_log else y
     X_arr = np.array(X, dtype=np.float64)
     X_arr = np.where(np.isinf(X_arr), 0.0, X_arr)
-    # CatBoost cannot handle NaN in float64 arrays — fill them
+    # CatBoost cannot handle NaN in float64 arrays - fill them
     X_arr = np.nan_to_num(X_arr, nan=0.0)
     y_arr = np.array(y_fit, dtype=np.float64)
     g_arr = np.array(groups)
@@ -1883,72 +1742,50 @@ def _optuna_search_cb(X, y, groups, use_log, target_name, n_trials=40):
     if is_drp and 'huber_delta' in best:
         delta = best.pop('huber_delta')
         best['loss_function'] = f'Huber:delta={delta}'
-    print(f"   Best Optuna-CB R²: {study.best_value:.4f}")
+    print(f"   Best Optuna-CB R2: {study.best_value:.4f}")
     print(f"   Best CB params: {best}")
     return best
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 7.  MAIN ENTRY POINT
-# ─────────────────────────────────────────────────────────────────────────────
+# MAIN ENTRY POINT
 def train_models(df, log_transform=None, use_optuna=True, dws_context=None):
-    """
-    v6 DWS-centric training.
-
-    df          : competition training data (enriched with satellite/terrain/weather)
-    dws_context : dict with 'all_dws', 'station_features', 'aug_rows'
-    """
-    print("\n══════════════════════════════════════════════════════════════")
-    print("   v6 DWS-CENTRIC MODELLING")
-    print("══════════════════════════════════════════════════════════════")
 
     if dws_context is None:
-        print("   ⚠ No DWS context — falling back to competition data only")
+        print("   No DWS context - falling back to competition data only")
         return _train_models_basic(df, log_transform, use_optuna)
 
     all_dws = dws_context['all_dws']
     exclude_dates = dws_context.get('test_dates_by_stn', {})
-
-    # ── Steps 1-5: Build combined training set (DWS + competition) ───────
-    #    Cached to disk so repeated runs skip the expensive construction.
+    
     COMBINED_CACHE = "combined_training_cache.parquet"
 
     if os.path.exists(COMBINED_CACHE):
-        print(f"\n── Loading cached combined training set from {COMBINED_CACHE} ──")
+        print(f"\n Loading cached combined training set from {COMBINED_CACHE} ")
         combined_df = pd.read_parquet(COMBINED_CACHE)
         print(f"   {len(combined_df)} rows, {len(combined_df.columns)} columns")
     else:
-        # ── 1. Build DWS-based training set ──────────────────────────────
-        print("\n── Step 1: Building DWS training dataset ──")
+        print("\n Building DWS training dataset ")
         dws_df = build_dws_training_set(all_dws, config.TARGETS,
                                         exclude_dates=exclude_dates)
 
-        # ── 2. Add station historical features ───────────────────────────
-        print("\n── Step 2: Station historical features ──")
+        print("\n Station historical features ")
         dws_df = add_station_historical_features(dws_df, all_dws)
 
-        # ── 2b. Add time-weighted station features ───────────────────────
-        print("\n── Step 2b: Time-weighted station features ──")
+        print("\n Time-weighted station features ")
         dws_df = add_time_weighted_station_features(dws_df, all_dws,
                                                      halflife_days=730)
 
-        # ── 2c. Add neighbor/upstream features ───────────────────────────
-        print("\n── Step 2c: Neighbor/upstream features ──")
+        print("\n Neighbor/upstream features ")
         import dws_data as _dws_mod
         dws_df = _dws_mod.build_neighbor_features(dws_df, all_dws)
 
-        # ── 3. Add enrichment features (satellite, terrain, weather) ─────
-        #       by merging from the competition enriched data
-        print("\n── Step 3: Merging enrichment features ──")
+        print("\n Merging enrichment features ")
         dws_df = _merge_enrichment_to_dws(dws_df, df)
 
-        # ── 4. Engineer derived features ─────────────────────────────────
-        print("\n── Step 4: Feature engineering ──")
+        print("\n eature engineering ")
         dws_df = engineer_features(dws_df)
 
-        # ── 5. Also include competition training data ────────────────────
-        #       (adds diversity from 162 non-test locations)
-        print("\n── Step 5: Combining with competition training data ──")
+        print("\n Combining with competition training data ")
         comp_df = _prepare_competition_data(df, all_dws, dws_df)
 
         if comp_df is not None and len(comp_df) > 0:
@@ -1967,8 +1804,8 @@ def train_models(df, log_transform=None, use_optuna=True, dws_context=None):
         print(f"   Cached combined training set to {COMBINED_CACHE} "
               f"({os.path.getsize(COMBINED_CACHE)/1e6:.1f} MB)")
 
-    # ── 6. KNN spatial features (chemistry-based, fit on full combined data) ─
-    print("\n── Step 6: KNN spatial features (chemistry-based) ──")
+    # KNN spatial features (chemistry-based, fit on full combined data) 
+    print("\n Step 6: KNN spatial features (chemistry-based) ")
     knn_enc = SpatialKNNEncoder(config.TARGETS, k_values=(5, 10))
     knn_enc.fit(combined_df)
     combined_knn = knn_enc.transform(combined_df, is_train=True)
@@ -1976,7 +1813,7 @@ def train_models(df, log_transform=None, use_optuna=True, dws_context=None):
                 if c.startswith('knn') or c == 'nn_dist_km']
     print(f"   Added {len(knn_cols)} KNN features")
 
-    # ── Feature selection ────────────────────────────────────────────────
+    #  Feature selection 
     always_drop = ['Sample Date', '_station', '_dt', '_loc_id', '_enc_loc_id',
                    '_is_missing', '_geo_key', 'Latitude', 'Longitude',
                    '_dws_station', 'date', 'station', 'key']
@@ -1986,7 +1823,6 @@ def train_models(df, log_transform=None, use_optuna=True, dws_context=None):
                      and pd.api.types.is_numeric_dtype(combined_df[c])]
     print(f"   Base features: {len(base_features)}")
 
-    # ── 7. Train per-target models (CHAINED: EC → TAL → DRP) ──────────
     import dws_data as dws_mod
     DWS_COL_MAP_INV = {v: k for k, v in dws_mod.DWS_COL_MAP.items()}
 
@@ -2005,7 +1841,6 @@ def train_models(df, log_transform=None, use_optuna=True, dws_context=None):
     # Store OOF chain predictions to use as features for downstream targets
     chain_oof_preds = {}  # {target: pd.Series of OOF predictions}
 
-    # Use CHAIN_ORDER (EC → TAL → DRP) instead of config.TARGETS
     for target in CHAIN_ORDER:
         if target not in combined_df.columns:
             continue
@@ -2016,12 +1851,12 @@ def train_models(df, log_transform=None, use_optuna=True, dws_context=None):
 
         estimators, target_tf = _get_models_for_target(target)
         # log_transform override: None means use the target-specific transform
-        use_log = True  # kept for backward compat with evaluate/prune
+        use_log = None
         tf_method = target_tf.method
 
         tdf = combined_df.dropna(subset=[target]).copy()
 
-        # ── Multi-target chaining: add upstream predictions as features ──
+        #  Multi-target chaining: add upstream predictions as features 
         for prev_target, prev_preds in chain_oof_preds.items():
             chain_col = f'_chain_{prev_target[:3].upper()}'
             tdf[chain_col] = prev_preds.reindex(tdf.index).values
@@ -2042,7 +1877,7 @@ def train_models(df, log_transform=None, use_optuna=True, dws_context=None):
         y = y.clip(lower=lo, upper=hi)
         tdf[target] = y
 
-        # ── Station-aware sample weights ─────────────────────────────
+        #  Station-aware sample weights 
         sample_weights = compute_station_weights(
             tdf, test_stations,
             base_weight=1.0, test_station_weight=4.0)
@@ -2051,11 +1886,10 @@ def train_models(df, log_transform=None, use_optuna=True, dws_context=None):
         print(f"   y: mean={y.mean():.2f}  std={y.std():.2f}  "
               f"skew={y.skew():.2f}  transform={tf_method}")
 
-        # ── 7a. LSTM temporal model ──────────────────────────────────
         target_dws_col = DWS_COL_MAP_INV.get(target)
         lstm_model = None
         if target_dws_col is not None:
-            print(f"\n   ── Step 7a: Training LSTM for {target} ──")
+            print(f"\n    Step 7a: Training LSTM for {target} ")
             lstm_model = StationLSTMModel(
                 target_dws_col=target_dws_col,
                 target_name=target,
@@ -2086,7 +1920,7 @@ def train_models(df, log_transform=None, use_optuna=True, dws_context=None):
         chain_cols = [c for c in tdf.columns if c.startswith('_chain_')]
         tgt_base.extend(chain_cols)
 
-        # Prune — pass groups to also drop station-constant features
+        # Prune - pass groups to also drop station-constant features
         X_base = tdf[tgt_base]
         tgt_feats = prune_features(X_base, y, tgt_base, use_log, groups=groups)
         # Add LSTM prediction as a feature if available
@@ -2098,7 +1932,6 @@ def train_models(df, log_transform=None, use_optuna=True, dws_context=None):
                 tgt_feats.append(cc)
         print(f"   Features after pruning: {len(tgt_feats)}")
 
-        # ── 7b. Adversarial validation ───────────────────────────────
         # Use test_template rows to detect distribution shift
         try:
             test_tmpl = dws_context.get('test_template')
@@ -2110,9 +1943,9 @@ def train_models(df, log_transform=None, use_optuna=True, dws_context=None):
                     adv_imp, adv_auc, shift_feats = adversarial_validation(
                         tdf, test_tmpl, adv_feats, top_k=5)
                     # If high shift, use adversarial score for sample weighting
-                    # (NOT as feature — avoids leaking "is_test_like" into model)
+                    # (NOT as feature - avoids leaking "is_test_like" into model)
                     if adv_auc > 0.7 and HAS_LGB:
-                        print("   Using adversarial score for sample weighting…")
+                        print("   Using adversarial score for sample weighting...")
                         clf_adv = lgb.LGBMClassifier(
                             n_estimators=100, max_depth=3, n_jobs=-1,
                             random_state=42, verbose=-1)
@@ -2131,7 +1964,7 @@ def train_models(df, log_transform=None, use_optuna=True, dws_context=None):
         except Exception as e:
             print(f"   Adversarial validation failed (non-fatal): {e}")
 
-        # Optuna — use only base features (no global KNN to avoid leakage)
+        # Optuna - use only base features (no global KNN to avoid leakage)
         if use_optuna and HAS_OPTUNA:
             optuna_feats = [f for f in tgt_feats if f not in config.TARGETS]
             optuna_feats = list(dict.fromkeys(optuna_feats))
@@ -2177,7 +2010,7 @@ def train_models(df, log_transform=None, use_optuna=True, dws_context=None):
                                   knn_k=(5, 10))
 
         # Final fit on ALL data
-        print("   Training final model on ALL data…")
+        print("   Training final model on ALL data...")
         tdf_final = knn_enc.transform(tdf, is_train=True)
         all_feats = [f for f in tdf_final.columns
                      if (f in tgt_feats
@@ -2197,9 +2030,7 @@ def train_models(df, log_transform=None, use_optuna=True, dws_context=None):
             groups=np.array(groups),
             sample_weight=sample_weights)
 
-        # ── Generate OOF chain predictions for downstream targets ────
-        # Quick OOF via StackingEnsemble-style K-fold
-        print("   Generating OOF chain predictions…")
+        print("   Generating OOF chain predictions...")
         try:
             n_splits_chain = min(5, len(set(groups)))
             gkf_chain = GroupKFold(n_splits=n_splits_chain)
@@ -2220,10 +2051,10 @@ def train_models(df, log_transform=None, use_optuna=True, dws_context=None):
         except Exception as e:
             print(f"   OOF chain generation failed (non-fatal): {e}")
 
-        # ── Station Calibrator ───────────────────────────────────────
+        #  Station Calibrator 
         calibrator = None
         if target_dws_col is not None:
-            print(f"   Training station calibrator for {target}…")
+            print(f"   Training station calibrator for {target}...")
             calibrator = StationCalibrator(blend_weight=0.5)
             calibrator.fit(all_dws, target, target_dws_col,
                            exclude_dates=exclude_dates)
@@ -2250,23 +2081,12 @@ def train_models(df, log_transform=None, use_optuna=True, dws_context=None):
     for t in config.TARGETS:
         if t in performance_report:
             m = performance_report[t]
-            print(f"   {t:>35s}:  R²={m['R2']:.3f}  RMSE={m['RMSE']:.1f}  "
+            print(f"   {t:>35s}:  R2={m['R2']:.3f}  RMSE={m['RMSE']:.1f}  "
                   f"log={m['log_transform']}")
 
     return performance_report
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# HELPERS
-# ─────────────────────────────────────────────────────────────────────────────
 def _merge_enrichment_to_dws(dws_df, enriched_df):
-    """
-    Merge satellite/terrain/weather features from enriched competition
-    data to DWS rows via nearest-location matching (IDW from 3 nearest).
-
-    Season-aware: uses per-season medians (DJF/MAM/JJA/SON) when DWS row
-    has date info, falls back to all-time median otherwise.
-    """
     enr_cols = [c for c in enriched_df.columns
                 if c not in config.TARGETS + ['Sample Date', 'Latitude', 'Longitude']
                 and pd.api.types.is_numeric_dtype(enriched_df[c])]
@@ -2428,7 +2248,6 @@ def _prepare_competition_data(comp_df, all_dws, dws_df):
     # Add DWS aux features where stations match
     comp = dws_mod.add_sameday_aux_features(comp, all_dws)
 
-    # Missingness indicator: does this comp row have DWS aux data?
     dws_aux_cols = [c for c in comp.columns if c.startswith('dws_aux_')]
     if dws_aux_cols:
         comp['_has_dws_aux'] = comp[dws_aux_cols].notna().any(axis=1).astype(int)
@@ -2438,7 +2257,6 @@ def _prepare_competition_data(comp_df, all_dws, dws_df):
     # Add lag features
     comp = dws_mod.add_lag_features(comp, all_dws, config.TARGETS)
 
-    # Missingness indicator: does this comp row have DWS lag data?
     lag_cols = [c for c in comp.columns if c.startswith('lag_') or c.startswith('roll')]
     if lag_cols:
         comp['_has_dws_lag'] = comp[lag_cols].notna().any(axis=1).astype(int)
@@ -2465,7 +2283,6 @@ def _prepare_competition_data(comp_df, all_dws, dws_df):
     comp.drop(columns=['date', 'station', '_dws_station'],
               errors='ignore', inplace=True)
 
-    # Ensure same columns exist (fill missing cols with NaN, not 0)
     dws_cols = set(dws_df.columns)
     for c in dws_cols:
         if c not in comp.columns and c not in config.TARGETS:
@@ -2535,28 +2352,6 @@ def _train_models_basic(df, log_transform, use_optuna):
 
     return performance_report
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 8.  PER-STATION DIRECT PREDICTION  (v8 – PRIMARY PREDICTOR)
-# ─────────────────────────────────────────────────────────────────────────────
-#
-# v8 change from v7: per-station prediction is now the PRIMARY predictor,
-# not a secondary refinement.  The global ensemble serves as a fallback.
-#
-# Architecture:
-#   A) ElasticNetCV from same-day auxiliary chemistry → target
-#      (with polynomial features for key interactions)
-#   B) Per-station GradientBoosting (for stations with ≥50 samples)
-#   C) Temporal interpolation from k nearest measurements in time
-#   D) Confidence-weighted blend of A, B, C
-#
-# Why this dominates the global model:
-#  • Same-day Na/DMS have ρ ≈ 0.99 with EC at any given station
-#  • pH/Ca/Mg → TAL with ρ ≈ 0.8+
-#  • P_Tot → DRP with ρ ≈ 0.67
-#  • No spatial generalisation needed — every test station is known
-#  • Per-station models avoid variance compression from global averaging
-# ─────────────────────────────────────────────────────────────────────────────
 
 _PS_AUX_COLS = [
     'pH_Diss_Water', 'Ca_Diss_Water', 'Mg_Diss_Water',
@@ -2720,12 +2515,11 @@ def _ps_regression(sdf, dws_col, target_date, aux_values, target_name=None):
         model.fit(X_train_s, y_train)
         pred = float(model.predict(X_test_s)[0])
 
-        # Confidence ≈ LOO-ish training R²
+        # Confidence ≈ LOO-ish training R2
         train_pred = model.predict(X_train_s)
         r2 = max(0, r2_score(y_train, train_pred))
 
     except Exception:
-        # Fallback to Ridge if ElasticNetCV fails
         alpha = max(1.0, 300.0 / len(subset))
         model = Ridge(alpha=alpha)
         model.fit(X_train_s, y_train)
@@ -2735,7 +2529,7 @@ def _ps_regression(sdf, dws_col, target_date, aux_values, target_name=None):
 
     # Clip to station's historical range with margin
     y_range = y_train.max() - y_train.min()
-    margin = y_range * 0.4  # slightly wider margin than v7
+    margin = y_range * 0.4  
     pred = np.clip(pred,
                    max(0, y_train.min() - margin),
                    y_train.max() + margin)
@@ -2745,12 +2539,6 @@ def _ps_regression(sdf, dws_col, target_date, aux_values, target_name=None):
 
 def _ps_gradient_boosting(sdf, dws_col, target_date, aux_values,
                           target_name=None):
-    """
-    Per-station GradientBoosting for stations with rich history (≥30 samples).
-    More expressive than ElasticNet for nonlinear relationships.
-
-    Returns (prediction, confidence, model_r2).
-    """
     train = sdf[sdf['date'].dt.date != target_date.date()].copy()
     train[dws_col] = pd.to_numeric(train[dws_col], errors='coerce')
     train = train[train[dws_col].notna()].copy()
@@ -2803,7 +2591,7 @@ def _ps_gradient_boosting(sdf, dws_col, target_date, aux_values,
     X_train = np.nan_to_num(X_train, nan=0.0)
     X_test = np.nan_to_num(X_test, nan=0.0)
 
-    # Regularised GBR — conservative to prevent per-station overfitting
+    # Regularised GBR - conservative to prevent per-station overfitting
     n_est = min(200, max(50, len(subset) // 2))
     model = GradientBoostingRegressor(
         n_estimators=n_est,
@@ -2818,7 +2606,7 @@ def _ps_gradient_boosting(sdf, dws_col, target_date, aux_values,
         model.fit(X_train, y_train)
         pred = float(model.predict(X_test)[0])
 
-        # OOF-like R² estimate via last 20% temporal split
+        # OOF-like R2 estimate via last 20% temporal split
         n_tr = int(0.8 * len(subset))
         if n_tr >= 10:
             dates_sorted = subset.sort_values('date').index
@@ -2855,21 +2643,6 @@ def _ps_gradient_boosting(sdf, dws_col, target_date, aux_values,
 
 
 def per_station_predict(sub_df, all_dws):
-    """
-    Per-station direct prediction for all targets (v8 – PRIMARY).
-
-    For each test row at station S on date D:
-      1. Look up same-day auxiliary chemistry from DWS
-      2. Train per-station ElasticNetCV with polynomial features
-      3. Train per-station GradientBoosting (if ≥30 samples)
-      4. Compute temporal interpolation from nearest measurements
-      5. Confidence-weighted blend of all available predictions
-
-    Returns
-    -------
-    dict : {target_name: np.ndarray of predictions}
-    dict : {target_name: np.ndarray of confidence scores}
-    """
     import dws_data as dws_mod
 
     sub = sub_df.copy()
@@ -2980,8 +2753,8 @@ def per_station_predict(sub_df, all_dws):
 
         avg_reg_r2 = np.mean(reg_r2s) if reg_r2s else 0
         avg_gb_r2 = np.mean(gb_r2s) if gb_r2s else 0
-        print(f"         reg={n_reg} (mean R²={avg_reg_r2:.3f})  "
-              f"gb={n_gb} (mean R²={avg_gb_r2:.3f})  "
+        print(f"         reg={n_reg} (mean R2={avg_reg_r2:.3f})  "
+              f"gb={n_gb} (mean R2={avg_gb_r2:.3f})  "
               f"interp={n_interp}  miss={n_miss}")
         print(f"         mean={preds.mean():.2f}  std={preds.std():.2f}  "
               f"min={preds.min():.2f}  max={preds.max():.2f}")
@@ -2991,22 +2764,8 @@ def per_station_predict(sub_df, all_dws):
     return results, confidences
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 9.  VARIANCE DECOMPRESSOR – fix global model prediction compression
-# ─────────────────────────────────────────────────────────────────────────────
+# VARIANCE DECOMPRESSOR - fix global model prediction compression
 class VarianceDecompressor:
-    """
-    Post-prediction variance rescaling per station.
-
-    The global ensemble compresses predictions toward the mean, producing
-    pred_std << true_std.  This decompressor rescales each station's
-    predictions to match the historical distribution (mean + std matching).
-
-    For station S:
-      pred_rescaled = station_mean + (pred - pred_mean) * (station_std / pred_std)
-
-    This is applied BEFORE blending with per-station predictions.
-    """
 
     def __init__(self):
         self.station_stats_ = {}  # {station: (mean, std)}
@@ -3037,13 +2796,6 @@ class VarianceDecompressor:
         return self
 
     def decompress(self, preds, stations):
-        """
-        Rescale predictions per station to match historical variance.
-
-        preds: array of predictions
-        stations: array of station codes
-        Returns: rescaled predictions
-        """
         result = preds.copy()
         for stn in set(stations):
             if pd.isna(stn) or stn not in self.station_stats_:
