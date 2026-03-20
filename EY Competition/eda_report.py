@@ -1,29 +1,4 @@
 #!/usr/bin/env python3
-"""
-eda_report.py — Premium Exploratory Data Analysis Report
-==========================================================
-Generates a self-contained HTML report with Fortune-500-grade
-visualisations.  Sections:
-
-  1.  Executive Summary (hero cards + key findings)
-  2.  Target Deep-Dive (violin / raincloud, QQ, pairwise hex-scatter)
-  3.  Feature–Target Correlations (lollipop + clustered heatmap)
-  4.  Mutual Information (nonlinear power, radar overlay)
-  5.  Feature Distributions (ridge-style grid + PCA)
-  6.  Spatial Analysis (hex-density, satellite basemap, within-loc CV)
-  7.  Temporal Analysis (area chart, seasonal violin, year×month heatmap)
-  8.  Collinearity Diagnosis (dendrogram + heatmap + top-pair table)
-  9.  Modellability & DWS Assessment (RF R², permutation importance,
-      DWS station network, DWS-vs-competition distribution overlay)
-
-Usage:
-    python eda_report.py                               # default CSV
-    python eda_report.py --input my_data.csv --top 30
-    python eda_report.py --force                       # overwrite existing
-
-Output:  eda_report.html  (self-contained, opens in any browser)
-"""
-
 import argparse
 import os
 import sys
@@ -60,7 +35,6 @@ except ImportError:
 
 import config
 
-# ── Premium Styling ──────────────────────────────────────────────────────────
 plt.rcParams.update({
     'figure.facecolor': 'white',
     'axes.facecolor':   '#FAFBFC',
@@ -79,7 +53,6 @@ plt.rcParams.update({
 })
 sns.set_theme(style="whitegrid", font_scale=1.05)
 
-# Brand palette
 BRAND = {
     'primary':   '#0B3D91',
     'secondary': '#1B6CB0',
@@ -109,11 +82,8 @@ PALETTE = sns.color_palette([
 ], 10)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  UTILITIES
-# ═══════════════════════════════════════════════════════════════════════════════
+# UTILITIES
 def fig_to_base64(fig, dpi=140):
-    """Convert a matplotlib figure to a base64-encoded PNG string."""
     buf = BytesIO()
     fig.savefig(buf, format='png', dpi=dpi, bbox_inches='tight',
                 facecolor='white', edgecolor='none')
@@ -123,7 +93,6 @@ def fig_to_base64(fig, dpi=140):
 
 
 def _get_feature_cols(df, targets):
-    """Return numeric feature columns, excluding targets and metadata."""
     exclude = set(targets) | {
         'Latitude', 'Longitude', 'Sample Date', 'date',
         '_dt', '_loc_id', '_geo_key', 'key', '_lat_r', '_lon_r',
@@ -134,13 +103,11 @@ def _get_feature_cols(df, targets):
 
 
 def _safe_impute(X):
-    """Median-impute NaN for sklearn estimators."""
     imp = SimpleImputer(strategy='median')
     return imp.fit_transform(X)
 
 
 def _safe_section(func, *args, fallback_title="Section", **kwargs):
-    """Run a section generator; return fallback HTML on any error."""
     try:
         return func(*args, **kwargs)
     except Exception as e:
@@ -149,11 +116,7 @@ def _safe_section(func, *args, fallback_title="Section", **kwargs):
                 f'<p class="warn-box">⚠ Section failed: <code>{e}</code></p>')
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  SECTION GENERATORS  (each returns an HTML string)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-# ── 1. Executive Summary ────────────────────────────────────────────────────
+# SECTION GENERATORS  (each returns an HTML string)
 def section_overview(df, targets, features):
     n_rows, n_cols = df.shape
     n_features = len(features)
@@ -166,7 +129,7 @@ def section_overview(df, targets, features):
             [df['Latitude'].round(3), df['Longitude'].round(3)]
         ).ngroups
 
-    # ── Missing-value lollipop chart ──
+    # Missing-value lollipop chart
     show_feats = features[:60]
     missing_pct = df[show_feats].isna().mean().sort_values(ascending=False)
     missing_pct = missing_pct[missing_pct > 0]
@@ -185,7 +148,7 @@ def section_overview(df, targets, features):
         ax.axhline(0.5, color=BRAND['danger'], ls='--', alpha=0.4, label='50 %')
         ax.legend(fontsize=9)
     else:
-        ax.text(0.5, 0.5, '✅  No missing values — dataset is complete!',
+        ax.text(0.5, 0.5, 'No missing values - dataset is complete!',
                 ha='center', va='center', fontsize=16, transform=ax.transAxes)
         ax.set_title('Missing Values')
     img = fig_to_base64(fig)
@@ -211,9 +174,8 @@ def section_overview(df, targets, features):
     return html
 
 
-# ── 2. Target Deep-Dive ─────────────────────────────────────────────────────
 def section_target_distributions(df, targets):
-    # ── 2a  Violin + strip (raincloud-style) ──
+    # Violin + strip (raincloud-style)
     fig, axes = plt.subplots(2, len(targets), figsize=(6.5 * len(targets), 11))
     if len(targets) == 1:
         axes = axes.reshape(-1, 1)
@@ -249,16 +211,16 @@ def section_target_distributions(df, targets):
         x_line = np.array([osm.min(), osm.max()])
         axes[1, i].plot(x_line, slope * x_line + intercept,
                         color=BRAND['danger'], lw=1.5, ls='--', label='Normal ref.')
-        axes[1, i].set_title(f'Q-Q Plot — {t}')
+        axes[1, i].set_title(f'Q-Q Plot - {t}')
         axes[1, i].set_xlabel('Theoretical Quantiles')
         axes[1, i].set_ylabel('Sample Quantiles')
         axes[1, i].legend(fontsize=8)
 
-    fig.suptitle('Target Deep-Dive — Distribution & Normality', fontsize=14, y=1.01)
+    fig.suptitle('Target Deep-Dive - Distribution & Normality', fontsize=14, y=1.01)
     fig.tight_layout()
     img1 = fig_to_base64(fig)
 
-    # ── 2b  Hex-scatter pairwise ──
+    # Hex-scatter pairwise
     n_tgt = len(targets)
     n_pairs = n_tgt * (n_tgt - 1) // 2
     fig2, axes2 = plt.subplots(1, max(n_pairs, 1),
@@ -293,7 +255,6 @@ def section_target_distributions(df, targets):
     """
 
 
-# ── 3. Feature–Target Correlations ─────────────────────────────────────────
 def section_correlations(df, targets, features, top_k=25):
     corr_data = {}
     for t in targets:
@@ -308,7 +269,7 @@ def section_correlations(df, targets, features, top_k=25):
         corr_data[t] = corrs
     corr_df = pd.DataFrame(corr_data, index=features)
 
-    # ── Lollipop charts per target ──
+    # Lollipop charts per target
     images = []
     for t in targets:
         top_feats = corr_df[t].abs().nlargest(top_k).index
@@ -328,7 +289,7 @@ def section_correlations(df, targets, features, top_k=25):
         fig.tight_layout()
         images.append(fig_to_base64(fig))
 
-    # ── Clustered heatmap (top union) ──
+    # Clustered heatmap (top union)
     all_top = set()
     for t in targets:
         all_top.update(corr_df[t].abs().nlargest(top_k).index)
@@ -354,7 +315,6 @@ def section_correlations(df, targets, features, top_k=25):
     """
 
 
-# ── 4. Mutual Information + Radar ───────────────────────────────────────────
 def section_mutual_info(df, targets, features, top_k=25):
     X = df[features].copy()
     X_imp = _safe_impute(X)
@@ -382,7 +342,7 @@ def section_mutual_info(df, targets, features, top_k=25):
         fig.tight_layout()
         images.append(fig_to_base64(fig))
 
-    # ── Radar overlay: top-8 features shared across targets ──
+    # Radar overlay: top-8 features shared across targets
     union_top = set()
     for t in targets:
         union_top.update(mi_results[t].nlargest(8).index)
@@ -402,7 +362,7 @@ def section_mutual_info(df, targets, features, top_k=25):
                       color=TARGET_COLORS.get(t, PALETTE[0]))
         ax_r.set_xticks(angles[:-1])
         ax_r.set_xticklabels(union_top, fontsize=8)
-        ax_r.set_title('MI Radar — Normalised Feature Importance', pad=20)
+        ax_r.set_title('MI Radar - Normalised Feature Importance', pad=20)
         ax_r.legend(loc='upper right', bbox_to_anchor=(1.3, 1.1), fontsize=9)
         fig_r.tight_layout()
         img_radar = fig_to_base64(fig_r)
@@ -417,14 +377,12 @@ def section_mutual_info(df, targets, features, top_k=25):
         for i in images)
     return f"""
     <h2>4 · Mutual Information (Nonlinear Predictive Power)</h2>
-    <p>MI captures <em>any</em> statistical dependency — not just monotonic.
+    <p>MI captures <em>any</em> statistical dependency - not just monotonic.
     Higher ≈ more informative.  Zero ≈ independent.</p>
     {img_html}
     {radar_html}
     """
 
-
-# ── 5. Feature Distributions + PCA ─────────────────────────────────────────
 def section_feature_distributions(df, targets, features, top_k=12):
     avg_corr = pd.Series(0.0, index=features)
     for t in targets:
@@ -452,7 +410,6 @@ def section_feature_distributions(df, targets, features, top_k=12):
     fig.tight_layout()
     img_dist = fig_to_base64(fig)
 
-    # ── PCA 2-D projection coloured by first target ──
     X_imp = _safe_impute(df[features])
     pca = PCA(n_components=2, random_state=42)
     pc = pca.fit_transform(X_imp)
@@ -477,8 +434,6 @@ def section_feature_distributions(df, targets, features, top_k=12):
     <img src="data:image/png;base64,{img_pca}" style="max-width:100%">
     """
 
-
-# ── 6. Spatial Analysis ────────────────────────────────────────────────────
 def _add_basemap(ax, zoom='auto'):
     if not HAS_CONTEXTILY:
         return
@@ -507,7 +462,7 @@ def section_spatial(df, targets):
         _add_basemap(ax)
         ax.set_xlabel('Longitude')
         ax.set_ylabel('Latitude')
-        ax.set_title(f'Hex-Density — {t}', fontsize=13)
+        ax.set_title(f'Hex-Density - {t}', fontsize=13)
         fig.tight_layout()
         images.append(fig_to_base64(fig))
 
@@ -525,7 +480,7 @@ def section_spatial(df, targets):
     fig2.tight_layout()
     images.append(fig_to_base64(fig2))
 
-    # ── Within-location CV violin ──
+    # Within-location CV violin
     cv_rows = []
     for t in targets:
         grp = df.groupby(
@@ -567,7 +522,6 @@ def section_spatial(df, targets):
     """
 
 
-# ── 7. Temporal Analysis ──────────────────────────────────────────────────
 def section_temporal(df, targets):
     if 'Sample Date' not in df.columns:
         return "<h2>7 · Temporal Analysis</h2><p>No 'Sample Date' column.</p>"
@@ -577,7 +531,7 @@ def section_temporal(df, targets):
     df_t['_dt'] = dt
     df_t['_ym'] = dt.dt.to_period('M')
 
-    # ── Area chart (monthly mean ± 1 SD) ──
+    # Area chart
     fig, axes = plt.subplots(len(targets), 1,
                               figsize=(14, 4 * len(targets)), sharex=True)
     if len(targets) == 1:
@@ -602,7 +556,7 @@ def section_temporal(df, targets):
     fig.tight_layout()
     img1 = fig_to_base64(fig)
 
-    # ── Seasonal violin ──
+    # Seasonal violin
     df_t['_month'] = dt.dt.month
     fig2, axes2 = plt.subplots(1, len(targets), figsize=(6.5 * len(targets), 5))
     if len(targets) == 1:
@@ -617,7 +571,7 @@ def section_temporal(df, targets):
     fig2.tight_layout()
     img2 = fig_to_base64(fig2)
 
-    # ── Year × Month heatmap ──
+    # Year x Month heatmap
     heatmap_imgs = []
     df_t['_year'] = dt.dt.year
     for t in targets:
@@ -628,7 +582,7 @@ def section_temporal(df, targets):
         fig3, ax3 = plt.subplots(figsize=(10, max(4, pivot.shape[0] * 0.35)))
         sns.heatmap(pivot, cmap=TARGET_CMAPS.get(t, 'viridis'), ax=ax3,
                     linewidths=0.3, cbar_kws={'label': f'Median {t}'})
-        ax3.set_title(f'{t} — Year × Month')
+        ax3.set_title(f'{t} - Year × Month')
         ax3.set_xlabel('Month')
         ax3.set_ylabel('Year')
         fig3.tight_layout()
@@ -646,8 +600,6 @@ def section_temporal(df, targets):
     {heatmap_html}
     """
 
-
-# ── 8. Collinearity Diagnosis ──────────────────────────────────────────────
 def section_collinearity(df, features, threshold=0.85):
     use_feats = features[:80]
     corr = df[use_feats].corr(method='spearman')
@@ -660,7 +612,7 @@ def section_collinearity(df, features, threshold=0.85):
                 pairs.append((use_feats[i], use_feats[j], r))
     pairs.sort(key=lambda x: abs(x[2]), reverse=True)
 
-    # ── Dendrogram ──
+    # Dendrogram
     dist = 1 - corr.abs().values
     np.fill_diagonal(dist, 0)
     dist = np.nan_to_num(dist, nan=1.0, posinf=1.0, neginf=0.0)
@@ -676,7 +628,7 @@ def section_collinearity(df, features, threshold=0.85):
     fig.tight_layout()
     img_dend = fig_to_base64(fig)
 
-    # ── Heatmap ──
+    # Heatmap
     if len(use_feats) <= 40:
         show = use_feats
     else:
@@ -701,7 +653,7 @@ def section_collinearity(df, features, threshold=0.85):
                   f'<th>Spearman ρ</th></tr></thead>'
                   f'<tbody>{pair_rows}</tbody></table>'
                   if pairs else
-                  '<p>No pairs exceed the threshold — good!</p>')
+                  '<p>No pairs exceed the threshold - good!</p>')
 
     return f"""
     <h2>8 · Collinearity Diagnosis</h2>
@@ -716,12 +668,7 @@ def section_collinearity(df, features, threshold=0.85):
     """
 
 
-# ── 9. Modellability + DWS Assessment ──────────────────────────────────────
 def section_modellability(df, targets, features, dws_dir=None):
-    """
-    RF cross-validation, permutation importance, AND DWS station/distribution
-    analysis — all in one section.
-    """
     X = df[features].copy()
     X_imp = _safe_impute(X)
 
@@ -755,7 +702,7 @@ def section_modellability(df, targets, features, dws_dir=None):
         perm_data[t] = pd.Series(perm.importances_mean,
                                   index=features).nlargest(15)
 
-    # ── Bar chart ──
+    # Bar chart
     fig, ax = plt.subplots(figsize=(10, 5))
     names = list(results.keys())
     means = [results[t]['mean_r2'] for t in names]
@@ -764,7 +711,7 @@ def section_modellability(df, targets, features, dws_dir=None):
     bars = ax.bar(names, means, yerr=stds, color=colors, edgecolor='white',
                   capsize=8, alpha=0.85, width=0.55)
     ax.set_ylabel('R² (Spatial CV)')
-    ax.set_title('Modellability — RandomForest (120 trees, depth=14)')
+    ax.set_title('Modellability - RandomForest (120 trees, depth=14)')
     ax.set_ylim(min(0, min(means) - 0.1), 1.0)
     ax.axhline(0, color='black', lw=0.5)
     for bar, m, s in zip(bars, means, stds):
@@ -773,7 +720,7 @@ def section_modellability(df, targets, features, dws_dir=None):
     fig.tight_layout()
     img_bar = fig_to_base64(fig)
 
-    # ── Fold-level dot plot ──
+    # Fold-level dot plot
     fig_fold, ax_fold = plt.subplots(figsize=(8, 4))
     for idx_t, t in enumerate(names):
         sc = results[t]['fold_scores']
@@ -790,7 +737,7 @@ def section_modellability(df, targets, features, dws_dir=None):
     fig_fold.tight_layout()
     img_fold = fig_to_base64(fig_fold)
 
-    # ── Permutation importance ──
+    # Permutation importance
     perm_imgs = []
     for t in targets:
         s = perm_data[t]
@@ -823,7 +770,6 @@ def section_modellability(df, targets, features, dws_dir=None):
             v = '🔴 Very weak / no signal'
         interpretations.append(f'<li><strong>{t}</strong> (R²={r2:.3f}): {v}</li>')
 
-    # ─────────── DWS sub-section ───────────
     dws_html = _subsection_dws(dws_dir, targets)
 
     return f"""
@@ -842,9 +788,7 @@ def section_modellability(df, targets, features, dws_dir=None):
     """
 
 
-# ── 9b. DWS sub-section (called from section_modellability) ────────────────
 def _subsection_dws(dws_dir, targets):
-    """DWS station network, temporal coverage, distribution overlay."""
     if dws_dir is None:
         return ''
     try:
@@ -884,7 +828,6 @@ def _subsection_dws(dws_dir, targets):
     </div>
     """]
 
-    # ── Station map ──
     fig, ax = plt.subplots(figsize=(12, 9))
     lats = [v[0] for v in STATION_REGISTRY.values()]
     lons = [v[1] for v in STATION_REGISTRY.values()]
@@ -908,7 +851,6 @@ def _subsection_dws(dws_dir, targets):
     parts.append(f'<img src="data:image/png;base64,{fig_to_base64(fig)}" '
                  f'style="max-width:100%;margin-bottom:15px;">')
 
-    # ── Temporal coverage heatmap ──
     year_data = []
     for stn, sdf in all_dws.items():
         if 'date' in sdf.columns:
@@ -934,7 +876,6 @@ def _subsection_dws(dws_dir, targets):
                      f'<img src="data:image/png;base64,{fig_to_base64(fig2)}" '
                      f'style="max-width:100%;margin-bottom:15px;">')
 
-    # ── Distribution overlay: DWS vs competition ──
     dws_col_map = DWS_COL_MAP
     n_maps = len(dws_col_map)
     if n_maps > 0:
@@ -969,15 +910,13 @@ def _subsection_dws(dws_dir, targets):
     return '\n'.join(parts)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
 #  HTML TEMPLATE
-# ═══════════════════════════════════════════════════════════════════════════════
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>EDA Report — Water Quality Prediction</title>
+<title>EDA Report - Water Quality Prediction</title>
 <style>
   :root {{
     --brand:    #0B3D91;
@@ -1069,36 +1008,23 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 </style>
 </head>
 <body>
-<h1>📊 EDA Report — Water Quality Prediction</h1>
+<h1> EDA Report - Water Quality Prediction</h1>
 <p style="color:#6C757D;">Generated: {timestamp} &nbsp;|&nbsp;
 Input: <code>{input_file}</code> &nbsp;|&nbsp;
-Pipeline v5 — EY Open Science Data Challenge</p>
+Pipeline v5 - EY Open Science Data Challenge</p>
 {sections}
 <div class="footer">
-  Auto-generated by <code>eda_report.py</code> — Premium Edition
+  Auto-generated by <code>eda_report.py</code>
 </div>
 </body>
 </html>"""
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
 #  MAIN
-# ═══════════════════════════════════════════════════════════════════════════════
 def generate_report(input_path, output_path='eda_report.html', top_k=25,
                     force=False):
-    """
-    Generate a self-contained HTML EDA report.
-
-    Parameters
-    ----------
-    input_path : str   – path to processed CSV
-    output_path : str  – destination HTML
-    top_k : int        – how many features to highlight per target
-    force : bool       – if False, skip when output_path already exists
-    """
-    # ── skip-if-exists guard ──
     if os.path.exists(output_path) and not force:
-        print(f"⏭  EDA report already exists at '{output_path}' — skipping. "
+        print(f"  EDA report already exists at '{output_path}' - skipping. "
               f"Pass force=True to regenerate.")
         return
 
@@ -1107,8 +1033,8 @@ def generate_report(input_path, output_path='eda_report.html', top_k=25,
     targets = [t for t in config.TARGETS if t in df.columns]
     if not targets:
         print(f"ERROR: No target columns found. Expected: {config.TARGETS}")
-        return   # don't sys.exit — let the caller continue
-
+        return  
+      
     features = _get_feature_cols(df, targets)
     print(f"Dataset: {df.shape[0]:,} rows × {df.shape[1]} cols  |  "
           f"{len(features)} numeric features  |  {len(targets)} targets")
@@ -1165,13 +1091,13 @@ def generate_report(input_path, output_path='eda_report.html', top_k=25,
     with open(output_path, 'w') as f:
         f.write(html)
     size_kb = len(html) // 1024
-    print(f"\n✅ Report saved to '{output_path}' ({size_kb} KB)")
+    print(f"\n Report saved to '{output_path}' ({size_kb} KB)")
     print(f"   Open in browser: file://{os.path.abspath(output_path)}")
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
-        description='Generate premium EDA report for water quality data')
+        description='Generate EDA report for water quality data')
     parser.add_argument('--input', '-i',
                         default='water_quality_processed_final.csv',
                         help='Path to processed CSV')
