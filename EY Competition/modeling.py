@@ -2815,7 +2815,7 @@ class VarianceDecompressor:
             # Rescale to match station distribution
             scale = stn_std / pred_std
             # Cap the scale factor to avoid extreme amplification
-            scale = min(scale, 5.0)
+            scale = min(scale, 2.0)
             result[mask] = stn_mean + (stn_preds - pred_mean) * scale
 
         return np.clip(result, 0, None)
