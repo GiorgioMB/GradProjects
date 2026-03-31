@@ -180,7 +180,7 @@ def fetch_geology(lat, lon):
         if not records:
             return empty
 
-       best = records[0]
+        best = records[0]
         for rec in records:
             if rec.get("lith") and rec["lith"].strip():
                 best = rec
