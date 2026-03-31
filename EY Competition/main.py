@@ -476,28 +476,46 @@ def generate_submission(train_df, report):
 
                 ps = ps_preds[target]
                 conf = ps_confs[target]
-                alpha = np.clip(conf, 0.3, 0.95)
-
+                # Keep global model as primary signal; use decompression and
+                # per-station predictions as conservative corrections only.
                 if 'Conductance' in target:
-                    alpha = np.clip(conf * 1.3, 0.5, 0.98)
+                    beta = 0.35  # decompression influence
+                    alpha_max = 0.35  # per-station max influence
                 elif 'Alkalinity' in target:
-                    alpha = np.clip(conf * 1.1, 0.4, 0.95)
+                    beta = 0.30
+                    alpha_max = 0.25
                 else:
-                    alpha = np.clip(conf, 0.3, 0.90)
+                    beta = 0.15
+                    alpha_max = 0.15
 
-                blended = alpha * ps + (1 - alpha) * global_decompressed
+                # Damped decompression to avoid distribution blow-up.
+                global_adj = global_preds + beta * (global_decompressed - global_preds)
+
+                # Confidence-gated per-station blending.
+                alpha = np.clip((conf - 0.80) * 1.5, 0.0, alpha_max)
+
+                # If per-station prediction is far from global, trust it less.
+                ratio = ps / (global_adj + 1e-6)
+                inconsistent = (ratio < 0.6) | (ratio > 1.6)
+                alpha[inconsistent] *= 0.35
+
+                ps_valid = np.isfinite(ps) & (ps > 0)
+                alpha[~ps_valid] = 0.0
+
+                blended = alpha * ps + (1 - alpha) * global_adj
                 blended = np.clip(blended, 0, None)
 
                 # Report blend stats
-                ps_valid = np.isfinite(ps) & (ps > 0)
                 n_ps = ps_valid.sum()
                 mean_alpha = alpha[ps_valid].mean() if n_ps > 0 else 0
                 print(f"      {target}: {n_ps}/{len(sub_df)} ps-valid, "
-                      f"mean_α={mean_alpha:.3f}")
+                      f"mean_alpha={mean_alpha:.3f}")
                 print(f"         global:  mean={global_preds.mean():.2f}  "
                       f"std={global_preds.std():.2f}")
                 print(f"         decomp:  mean={global_decompressed.mean():.2f}  "
                       f"std={global_decompressed.std():.2f}")
+                print(f"         adjusted: mean={global_adj.mean():.2f}  "
+                      f"std={global_adj.std():.2f}  beta={beta:.2f}")
                 print(f"         ps:      mean={ps.mean():.2f}  "
                       f"std={ps.std():.2f}")
                 print(f"         blended: mean={blended.mean():.2f}  "
