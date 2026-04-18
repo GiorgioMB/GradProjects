@@ -1,5 +1,5 @@
 # Optimizing Clean Water Supply: Geospatial Machine Learning Pipeline
-**EY Open Science Data Challenge**
+**🏆 Semifinalist Submission: EY Open Science Data Challenge**
 
 This repository contains an end-to-end machine learning pipeline designed to predict water quality indicators (Total Alkalinity, Electrical Conductance, Dissolved Reactive Phosphorus) for monitoring stations across South Africa. 
 
